@@ -18,6 +18,9 @@ dependencies = [
 build = [
     "cyvcf2>=0.30",
 ]
+liftover = [
+    "pyliftover>=0.4",
+]
 dev = [
     "pytest>=7.0",
     "pytest-benchmark",

@@ -28,6 +28,7 @@ import zstandard as zstd
 from .quantize import encode_z, encode_neff, encode_raf, Z_NA
 from .store import ChunkedMatrix
 from .vcf import read_vcf
+from .liftover import builds_differ, make_lifted_lookup, normalise_build
 
 log = logging.getLogger(__name__)
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
@@ -71,8 +72,16 @@ def _load_variants(variants_path: str | Path) -> np.ndarray:
     return np.array(rows, dtype=dt)
 
 
-def _load_trait_list(trait_tsv: str | Path) -> list[tuple[str, str]]:
-    """Returns list of (trait_id, vcf_path)."""
+def _load_trait_list(trait_tsv: str | Path) -> list[tuple[str, str, str, str | None]]:
+    """
+    Returns list of (trait_id, vcf_path, trait_name, vcf_build_or_None).
+
+    TSV columns (tab-separated, no header):
+        1  trait_id    required
+        2  vcf_path    required
+        3  trait_name  optional (empty string if absent)
+        4  build       optional (hg19 / hg38 / GRCh37 / GRCh38)
+    """
     pairs = []
     with open(trait_tsv) as fh:
         for line in fh:
@@ -80,14 +89,16 @@ def _load_trait_list(trait_tsv: str | Path) -> list[tuple[str, str]]:
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            pairs.append((parts[0], parts[1]))
+            trait_name = parts[2].strip() if len(parts) > 2 else ""
+            vcf_build = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
+            pairs.append((parts[0], parts[1], trait_name, vcf_build))
     return pairs
 
 
 def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
     """Worker: read one VCF and return (local_t_idx, z, neff)."""
-    local_t_idx, vcf_path, variant_ids = args
-    z, neff = read_vcf(vcf_path, variant_ids)
+    local_t_idx, vcf_path, variant_ids, key_lookup = args
+    z, neff = read_vcf(vcf_path, variant_ids, key_lookup=key_lookup)
     return local_t_idx, z, neff
 
 
@@ -105,6 +116,7 @@ def build_database(
     pval_thresholds: Sequence[float] = DEFAULT_PVAL_THRESHOLDS,
     raf_path: str | Path | None = None,
     overwrite: bool = False,
+    variants_build: str | None = None,
 ) -> None:
     out = Path(output_dir)
     if out.exists() and not overwrite:
@@ -117,14 +129,36 @@ def build_database(
     V = len(variants)
     T = len(trait_pairs)
     CV, CT = chunk_shape
-    log.info("Building pleiodb: V=%d  T=%d  chunks=%s", V, T, chunk_shape)
+
+    # Normalise the canonical variants build (if supplied)
+    canon_build: str | None = normalise_build(variants_build) if variants_build else None
+    log.info(
+        "Building pleiodb: V=%d  T=%d  chunks=%s  variants_build=%s",
+        V, T, chunk_shape, canon_build or "unspecified",
+    )
 
     variant_ids = list(variants["id"])
 
+    # Pre-compute liftover lookups for each unique vcf_build that differs from
+    # the canonical variants build.  Shared across traits in the same build.
+    _lifted_cache: dict[str, dict[str, int]] = {}
+
+    def _key_lookup_for(vcf_build: str | None) -> dict[str, int] | None:
+        if canon_build is None or vcf_build is None:
+            return None
+        vcf_build_norm = normalise_build(vcf_build)
+        if vcf_build_norm == canon_build:
+            return None
+        if vcf_build_norm not in _lifted_cache:
+            _lifted_cache[vcf_build_norm] = make_lifted_lookup(
+                variants, from_build=canon_build, to_build=vcf_build_norm
+            )
+        return _lifted_cache[vcf_build_norm]
+
     # ---- Write variant / trait metadata -----------------------------------
     np.save(out / "variants.npy", variants)
-    trait_dt = np.dtype([("id", "U64")])
-    trait_arr = np.array([(tid,) for tid, _ in trait_pairs], dtype=trait_dt)
+    trait_dt = np.dtype([("id", "U64"), ("name", "U256")])
+    trait_arr = np.array([(tid, name) for tid, _, name, _ in trait_pairs], dtype=trait_dt)
     np.save(out / "traits.npy", trait_arr)
 
     # ---- Initialise chunked matrices --------------------------------------
@@ -145,7 +179,10 @@ def build_database(
         z_block = np.full((V, B), np.nan, dtype=np.float32)
         neff_block = np.full((V, B), np.nan, dtype=np.float32)
 
-        args = [(j, vcf_path, variant_ids) for j, (_, vcf_path) in enumerate(batch_traits)]
+        args = [
+            (j, vcf_path, variant_ids, _key_lookup_for(vcf_build))
+            for j, (_, vcf_path, _, vcf_build) in enumerate(batch_traits)
+        ]
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
             for fut in as_completed(futures):
@@ -193,6 +230,7 @@ def build_database(
         "z_scale": 100,
         "neff_encoding": "log2_u16_frac11",
         "format_version": 1,
+        "variants_build": canon_build,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log.info("Build complete → %s", out)

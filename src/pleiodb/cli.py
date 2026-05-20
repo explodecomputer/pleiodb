@@ -74,7 +74,14 @@ def main():
 @click.option("--pval", multiple=True, default=["5e-8", "1e-5"],
               show_default=True, help="P-value threshold(s) for significance masks")
 @click.option("--overwrite", is_flag=True, default=False)
-def build(output_dir, variants, traits, raf, chunk_v, chunk_t, workers, pval, overwrite):
+@click.option(
+    "--variants-build", default=None,
+    help="Genome build of the variant list (hg19/hg38/GRCh37/GRCh38). "
+         "When set, VCF files whose traits TSV specifies a different build "
+         "will have their coordinates lifted over automatically.",
+)
+def build(output_dir, variants, traits, raf, chunk_v, chunk_t, workers, pval, overwrite,
+          variants_build):
     """Build a pleiodb database from GWAS-VCF files."""
     from .build import build_database
     thresholds = [float(p) for p in pval]
@@ -87,6 +94,7 @@ def build(output_dir, variants, traits, raf, chunk_v, chunk_t, workers, pval, ov
         pval_thresholds=thresholds,
         raf_path=raf,
         overwrite=overwrite,
+        variants_build=variants_build,
     )
     click.echo(f"Database written to {output_dir}")
 

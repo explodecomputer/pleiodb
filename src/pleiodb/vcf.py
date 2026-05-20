@@ -36,6 +36,7 @@ def read_vcf(
     vcf_path: str | Path,
     variant_ids: Sequence[str],
     id_col: str = "ID",
+    key_lookup: dict[str, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Parse a GWAS-VCF file and return (z_scores, neff) float32 arrays aligned
@@ -46,20 +47,30 @@ def read_vcf(
     vcf_path    : path to (possibly bgzipped + tabix-indexed) GWAS-VCF
     variant_ids : ordered list of variant identifiers to extract
     id_col      : "ID" to match on VCF ID field, or "CHRPOSREFALT" to
-                  match on chr:pos:ref:alt key
+                  match on chr:pos:ref:alt key.  Ignored when key_lookup is
+                  provided.
+    key_lookup  : optional pre-built mapping of 'chrom:pos:ref:alt' (in the
+                  VCF's own coordinate system) → index into variant_ids.
+                  Supply this when the variant list and VCF are on different
+                  genome builds (positions already lifted by the caller).
     """
     path = str(vcf_path)
     n = len(variant_ids)
     z_out = np.full(n, _MISSING, dtype=np.float32)
     neff_out = np.full(n, _MISSING, dtype=np.float32)
 
-    lookup: dict[str, int] = {vid: i for i, vid in enumerate(variant_ids)}
+    if key_lookup is not None:
+        lookup = key_lookup
+    else:
+        lookup = {vid: i for i, vid in enumerate(variant_ids)}
 
     vcf = _open_vcf(path)
     seen = 0
 
     for rec in vcf:
-        if id_col == "ID":
+        if key_lookup is not None:
+            key = _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
+        elif id_col == "ID":
             key = rec.ID or _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
         else:
             key = _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])

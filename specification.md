@@ -217,11 +217,13 @@ Tab-separated, no header.  Lines beginning with `#` are ignored.
 |--------|------|-------------|
 | 1 `trait_id` | string | Unique identifier for the trait (e.g. `ieu-b-2`, `ukb-b-1234`). Stored in the database and used in all query output. |
 | 2 `vcf_path` | string | Absolute or relative path to a GWAS-VCF file (plain or bgzipped `.vcf.gz`). A tabix index (`.tbi`) is not required but speeds up region-restricted ingestion. |
+| 3 `trait_name` | string | Optional human-readable label (e.g. `Body mass index`). Stored in the database; empty string if absent. |
+| 4 `build` | string | Optional genome build of the VCF (`hg19`, `hg38`, `GRCh37`, `GRCh38`). Used with `--variants-build` to trigger automatic liftover when builds differ. |
 
 **Example:**
 ```
-ieu-b-2	/data/gwas/body_mass_index.gwas.vcf.gz
-ukb-b-1234	/data/gwas/ukbb_ldl.gwas.vcf.gz
+ieu-b-2	/data/gwas/body_mass_index.gwas.vcf.gz	Body mass index	hg19
+ukb-b-1234	/data/gwas/ukbb_ldl.gwas.vcf.gz	LDL cholesterol	hg38
 finn-r-T2D	/data/gwas/finngen_T2D.vcf.gz
 ```
 
