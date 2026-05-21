@@ -76,7 +76,7 @@ class TestHg19Build:
     def test_dimensions(self, tmp_path):
         db_path = _build(tmp_path, VARIANTS_HG19)
         db = _open(db_path)
-        assert db.V == 500
+        assert db.V == 501
         assert db.T == 5
 
     def test_spot_check_zscore(self, tmp_path):
@@ -148,7 +148,7 @@ class TestHg38Liftover:
         return _open(db_path)
 
     def test_dimensions(self, db):
-        assert db.V == 500
+        assert db.V == 501
         assert db.T == 5
 
     def test_match_rate(self, db):
