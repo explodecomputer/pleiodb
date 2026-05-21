@@ -4,12 +4,12 @@ GWASDatabase — top-level handle that owns all sub-matrices and metadata.
 Directory layout:
   {name}.pleiodb/
     meta.json          — dimensions, chunk sizes, dtypes, thresholds
-    variants.npy       — structured array: id(U32), chr(U4), pos(u4), ref(U1), alt(U1)
-    traits.npy         — structured array: id(U64)
+    variants.npy       — structured array: id(U64), chrom(U10), pos(u4), a1(U512), a2(U512)
+    traits.npy         — structured array: id(U64), name(U256)
     zscore.bin/.cidx   — V×T  int16  (z * 100, NA = -32768)
     neff.bin/.cidx     — V×T  uint16 (log2-encoded, NA = 0xFFFF)
-    raf.f16            — V    float16
-    lambda.bin/.cidx   — T×T  float16 (upper triangle reflected; symmetric)
+    eaf.f16            — V    float16  effect allele frequency (A2)
+    lambda.bin/.cidx   — T×T  float16 (symmetric)
     masks/
       {thr}.coo.zst    — COO-format significance hits: sorted (v_idx u4, t_idx u4) pairs
     neff_base.f32      — T    float32  per-trait median Neff (used as fallback)
@@ -27,8 +27,8 @@ import zstandard as zstd
 
 from .store import ChunkedMatrix
 from .quantize import (
-    decode_z, decode_neff, decode_raf,
-    encode_z, encode_neff, encode_raf,
+    decode_z, decode_neff, decode_eaf,
+    encode_z, encode_neff, encode_eaf,
     reconstruct_beta_se, Z_SCALE, Z_NA, NEFF_NA,
 )
 
@@ -44,7 +44,7 @@ class GWASDatabase:
         self._traits: np.ndarray | None = None
         self._zscore: ChunkedMatrix | None = None
         self._neff: ChunkedMatrix | None = None
-        self._raf: np.ndarray | None = None
+        self._eaf: np.ndarray | None = None
         self._lambda: ChunkedMatrix | None = None
         self._neff_base: np.ndarray | None = None
 
@@ -99,11 +99,11 @@ class GWASDatabase:
         return self._traits
 
     @property
-    def raf(self) -> np.ndarray:
-        if self._raf is None:
-            raw = np.fromfile(self.path / "raf.f16", dtype=np.float16)
-            self._raf = decode_raf(raw)
-        return self._raf
+    def eaf(self) -> np.ndarray:
+        if self._eaf is None:
+            raw = np.fromfile(self.path / "eaf.f16", dtype=np.float16)
+            self._eaf = decode_eaf(raw)
+        return self._eaf
 
     @property
     def neff_base(self) -> np.ndarray:
@@ -190,8 +190,8 @@ class GWASDatabase:
         z = self.zscore_variant(v_idx)
         neff_raw = self._neff.get_block(v_idx, v_idx + 1, 0, self.T)[0]
         neff = decode_neff(neff_raw)
-        raf_v = self.raf[v_idx]
-        return reconstruct_beta_se(z, neff, np.array([raf_v], dtype=np.float32))
+        eaf_v = self.eaf[v_idx]
+        return reconstruct_beta_se(z, neff, np.array([eaf_v], dtype=np.float32))
 
     def beta_se_block(
         self, v_indices: Sequence[int], t_indices: Sequence[int]
@@ -204,8 +204,8 @@ class GWASDatabase:
         neff_raw = self._neff.get_block(v_min, v_max, t_min, t_max)
         z = decode_z(z_raw)[np.ix_(v_idx - v_min, t_idx - t_min)]
         neff = decode_neff(neff_raw)[np.ix_(v_idx - v_min, t_idx - t_min)]
-        raf = self.raf[v_idx]
-        return reconstruct_beta_se(z, neff, raf)
+        eaf = self.eaf[v_idx]
+        return reconstruct_beta_se(z, neff, eaf)
 
     # ------------------------------------------------------------------
     # P-value / significance queries

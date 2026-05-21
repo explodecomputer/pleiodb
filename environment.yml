@@ -1,0 +1,15 @@
+name: pleiodb
+
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.10
+  - bcftools>=1.17          # VCF pre-filtering (bioconda)
+  - cyvcf2>=0.30            # VCF parsing (bioconda) — must come from conda, not pip
+  - pip
+  - pip:
+    - pyliftover>=0.4       # coordinate liftover (pure Python, pip is fine)
+    - -e .                  # install pleiodb itself in editable mode

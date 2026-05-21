@@ -3,7 +3,7 @@ Quantization helpers for GWAS statistics.
 
 Z-score  → int16   (scale=100, NA=INT16_MIN, clipped ±327)
 Neff     → uint16  (log2-encoded, 11 fractional bits, NA=0xFFFF)
-RAF      → float16 (direct cast)
+EAF      → float16 (direct cast; effect allele = A2, alphabetically second)
 Lambda   → float16 (direct cast)
 """
 
@@ -64,17 +64,17 @@ def decode_neff(arr: np.ndarray) -> np.ndarray:
     return out
 
 
-def encode_raf(raf: np.ndarray) -> np.ndarray:
+def encode_eaf(eaf: np.ndarray) -> np.ndarray:
     """float32 → float16 (direct cast; NaN preserved)."""
-    return raf.astype(np.float16)
+    return eaf.astype(np.float16)
 
 
-def decode_raf(arr: np.ndarray) -> np.ndarray:
+def decode_eaf(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.float32)
 
 
 def reconstruct_beta_se(
-    z: np.ndarray, neff: np.ndarray, raf: np.ndarray
+    z: np.ndarray, neff: np.ndarray, eaf: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Reconstruct (beta, se) from stored quantities.
@@ -84,11 +84,11 @@ def reconstruct_beta_se(
 
     z    : (..., T) float32
     neff : (..., T) float32
-    raf  : (...,)   float32  — broadcast over T automatically when shape is (V,)
+    eaf  : (...,)   float32  — effect allele freq (A2); broadcast over T when shape is (V,)
     """
-    if raf.ndim < z.ndim:
-        raf = raf[..., np.newaxis]
-    denom = neff * 2.0 * raf * (1.0 - raf)
+    if eaf.ndim < z.ndim:
+        eaf = eaf[..., np.newaxis]
+    denom = neff * 2.0 * eaf * (1.0 - eaf)
     se = np.where(denom > 0, 1.0 / np.sqrt(denom), np.nan)
     beta = z * se
     return beta, se

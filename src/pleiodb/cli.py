@@ -60,11 +60,9 @@ def main():
 @main.command()
 @click.argument("output_dir")
 @click.option("--variants", "-v", required=True,
-              help="TSV: id  chrom  pos  ref  alt")
+              help="TSV: ALID  EAF  (ALID = CHROM:POS_A1_A2, alphabetical alleles)")
 @click.option("--traits", "-t", required=True,
-              help="TSV: trait_id  /path/to/gwas.vcf.gz")
-@click.option("--raf", default=None,
-              help="TSV: variant_id  raf  (optional)")
+              help="TSV: trait_id  trait_name  vcf_path  [build]")
 @click.option("--chunk-v", default=512, show_default=True,
               help="Chunk size along variant axis")
 @click.option("--chunk-t", default=512, show_default=True,
@@ -80,7 +78,7 @@ def main():
          "When set, VCF files whose traits TSV specifies a different build "
          "will have their coordinates lifted over automatically.",
 )
-def build(output_dir, variants, traits, raf, chunk_v, chunk_t, workers, pval, overwrite,
+def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwrite,
           variants_build):
     """Build a pleiodb database from GWAS-VCF files."""
     from .build import build_database
@@ -92,7 +90,6 @@ def build(output_dir, variants, traits, raf, chunk_v, chunk_t, workers, pval, ov
         chunk_shape=(chunk_v, chunk_t),
         workers=workers,
         pval_thresholds=thresholds,
-        raf_path=raf,
         overwrite=overwrite,
         variants_build=variants_build,
     )

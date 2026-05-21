@@ -11,13 +11,10 @@ dependencies = [
     "numpy>=1.24",
     "zstandard>=0.21",
     "click>=8.0",
-    "pandas>=2.0",
+    "cyvcf2>=0.30",
 ]
 
 [project.optional-dependencies]
-build = [
-    "cyvcf2>=0.30",
-]
 liftover = [
     "pyliftover>=0.4",
 ]

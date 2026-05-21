@@ -44,17 +44,17 @@ def make_lifted_lookup(
     variants: np.ndarray,
     from_build: str,
     to_build: str,
-) -> dict[str, int]:
+) -> dict[str, list[tuple[str, str, int]]]:
     """
-    Lift variant positions from *from_build* to *to_build* and return a lookup
-    mapping ``'chrom:pos:ref:alt'`` keys (in *to_build* coordinates) to the
-    corresponding row index in *variants*.
+    Lift variant positions from *from_build* to *to_build* and return a
+    positional lookup mapping ``'chrom:pos'`` keys (in *to_build* coordinates)
+    to ``[(a1, a2, row_idx), ...]`` entries.
 
     Both ``chr``-prefixed and bare chromosome forms are inserted so the lookup
     works regardless of the VCF's CHROM convention.
 
-    Variants whose position cannot be lifted are omitted; they will remain NaN
-    for any trait whose VCF uses *to_build*.
+    Variants whose position cannot be lifted are omitted (NaN for any trait
+    whose VCF uses *to_build*).
 
     Requires ``pyliftover``: ``pip install pyliftover``.
     """
@@ -71,20 +71,19 @@ def make_lifted_lookup(
     log.info("Lifting %d variants %s → %s", len(variants), from_build, to_build)
     lo = LiftOver(from_build, to_build)
 
-    lookup: dict[str, int] = {}
+    lookup: dict[str, list[tuple[str, str, int]]] = {}
     n_fail = 0
 
     for i, row in enumerate(variants):
         chrom = str(row["chrom"])
         pos = int(row["pos"])
-        ref = str(row["ref"])
-        alt = str(row["alt"])
+        a1 = str(row["a1"])
+        a2 = str(row["a2"])
 
         if not chrom or pos == 0:
             n_fail += 1
             continue
 
-        # pyliftover requires the 'chr' prefix and 0-based coordinates
         chrom_in = chrom if chrom.startswith("chr") else f"chr{chrom}"
         result = lo.convert_coordinate(chrom_in, pos - 1)
 
@@ -92,13 +91,13 @@ def make_lifted_lookup(
             n_fail += 1
             continue
 
-        new_chrom_full: str = result[0][0]          # e.g. 'chr1'
-        new_pos = int(result[0][1]) + 1              # back to 1-based
+        new_chrom_full: str = result[0][0]
+        new_pos = int(result[0][1]) + 1
         new_chrom_bare = new_chrom_full.replace("chr", "")
 
-        # Insert both forms so matching works regardless of VCF CHROM style
         for chrom_form in (new_chrom_bare, new_chrom_full):
-            lookup[f"{chrom_form}:{new_pos}:{ref}:{alt}"] = i
+            key = f"{chrom_form}:{new_pos}"
+            lookup.setdefault(key, []).append((a1, a2, i))
 
     if n_fail:
         log.warning(

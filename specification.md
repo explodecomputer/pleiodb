@@ -24,7 +24,7 @@ study.pleiodb/
 ├── zscore.cidx         ← uint64 offset index for zscore.bin
 ├── neff.bin            ← V×T  uint16 compressed chunks
 ├── neff.cidx
-├── raf.f16             ← V    float16  (one value per variant)
+├── eaf.f16             ← V    float16  effect allele freq (A2, one value per variant)
 ├── neff_base.f32       ← T    float32  (per-trait median Neff, fallback)
 ├── lambda.bin          ← T×T  float16  compressed chunks
 ├── lambda.cidx
@@ -83,11 +83,12 @@ Neff = 2^(stored / 2048)     (NA where stored == 0xFFFF)
 
 ---
 
-### 3. Reference allele frequency  `raf`  — V × 1, `float16`
+### 3. Effect allele frequency  `eaf`  — V × 1, `float16`
 
-Stored as a flat binary file of `V` float16 values (200 KB raw).
-float16 gives ~0.1 % relative precision for frequencies in (0.001, 0.999),
-sufficient for SE reconstruction.
+Frequency of A2 (the effect / alphabetically-second allele).  Stored as a
+flat binary file of `V` float16 values (200 KB raw).  float16 gives ~0.1 %
+relative precision for frequencies in (0.001, 0.999), sufficient for SE
+reconstruction.
 
 ---
 
@@ -191,20 +192,21 @@ Tab-separated, no header.  Lines beginning with `#` are ignored.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| 1 `id` | string | Variant identifier used to match against VCF `ID` fields (e.g. `rs1234567` or `chr1:204518098:C:T`). Must be unique. |
-| 2 `chrom` | string | Chromosome (e.g. `chr1` or `1`). Used for region queries; can be omitted if region queries are not needed. |
-| 3 `pos` | integer | Base-pair position (1-based). Used for region queries. |
-| 4 `ref` | string | Reference allele. |
-| 5 `alt` | string | Alternate (effect) allele. |
+| 1 `alid` | string | **ALID** — `CHROM:POS_A1_A2` where A1 ≤ A2 alphabetically (e.g. `10:101558746_G_T`). Encodes all coordinates; must be unique. |
+| 2 `eaf` | float | Effect allele frequency for A2 (0 < EAF < 1). Optional: omit or leave blank to store NaN (beta/SE reconstruction will not be possible). |
 
-Columns 2–5 are optional but must be present together if any are given (the
-parser fills empty strings / zero for absent columns).
+Variants with non-canonical allele order (A1 > A2) are automatically
+normalised on load: the ALID is rewritten and EAF is flipped to `1 − EAF`.
+
+VCF records are matched by **position** (CHROM:POS), then confirmed by
+allele pair.  When the VCF alleles are non-canonical (genome-ref REF > ALT
+alphabetically), the z-score is negated so it reflects the effect of A2.
 
 **Example:**
 ```
-rs1234567	chr1	204518098	C	T
-rs7412	chr19	44908822	C	T
-chr6:161010118:C:T	chr6	161010118	C	T
+10:101558746_G_T	0.56079
+10:1206798_C_T	0.071479
+19:44908822_C_T	0.12
 ```
 
 ---
@@ -216,36 +218,15 @@ Tab-separated, no header.  Lines beginning with `#` are ignored.
 | Column | Type | Description |
 |--------|------|-------------|
 | 1 `trait_id` | string | Unique identifier for the trait (e.g. `ieu-b-2`, `ukb-b-1234`). Stored in the database and used in all query output. |
-| 2 `vcf_path` | string | Absolute or relative path to a GWAS-VCF file (plain or bgzipped `.vcf.gz`). A tabix index (`.tbi`) is not required but speeds up region-restricted ingestion. |
-| 3 `trait_name` | string | Optional human-readable label (e.g. `Body mass index`). Stored in the database; empty string if absent. |
+| 2 `trait_name` | string | Optional human-readable label (e.g. `Body mass index`). Stored in the database; empty string if absent. |
+| 3 `vcf_path` | string | Absolute or relative path to a GWAS-VCF file (bgzipped `.vcf.gz` with CSI or TBI index recommended). |
 | 4 `build` | string | Optional genome build of the VCF (`hg19`, `hg38`, `GRCh37`, `GRCh38`). Used with `--variants-build` to trigger automatic liftover when builds differ. |
 
 **Example:**
 ```
-ieu-b-2	/data/gwas/body_mass_index.gwas.vcf.gz	Body mass index	hg19
-ukb-b-1234	/data/gwas/ukbb_ldl.gwas.vcf.gz	LDL cholesterol	hg38
-finn-r-T2D	/data/gwas/finngen_T2D.vcf.gz
-```
-
----
-
-### `--raf`  (optional)
-
-Tab-separated, no header.  Lines beginning with `#` are ignored.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| 1 `id` | string | Variant identifier — must match the `id` column in `--variants`. |
-| 2 `raf` | float | Reference allele frequency in the reference population (0 < RAF < 1). |
-
-If omitted, RAF is set to `NaN` for all variants and beta/SE reconstruction
-will not be possible.
-
-**Example:**
-```
-rs1234567	0.42
-rs7412	0.12
-chr6:161010118:C:T	0.31
+ieu-b-2	Body mass index	/data/gwas/body_mass_index.gwas.vcf.gz	hg19
+ukb-b-1234	LDL cholesterol	/data/gwas/ukbb_ldl.gwas.vcf.gz	hg38
+finn-r-T2D		/data/gwas/finngen_T2D.vcf.gz
 ```
 
 ---
@@ -274,20 +255,21 @@ are silently skipped.  Variants in the list that are absent from a VCF receive
 
 ## Beta / SE reconstruction
 
-Given z-score, Neff, and RAF for variant v in trait t:
+Given z-score, Neff, and EAF for variant v in trait t:
 
 ```
 SE   = 1 / sqrt(Neff × 2 × p × (1 − p))
 beta = z × SE
 ```
 
-where `p = RAF`.  This formula assumes additive genetic model and diploid
-genotypes; it matches the standard formula used in GWAS-VCF generation.
+where `p = EAF` (effect allele frequency of A2).  This formula is symmetric
+in p and 1−p, so EAF and RAF give identical SE; only the sign of beta differs
+depending on which allele is the effect allele — in pleiodb it is always A2.
 
 Reconstruction error budget:
 - z quantisation: ±0.005 → ±0.5 % error in beta at z=1
 - Neff quantisation: ±0.034 % → negligible SE error
-- RAF (float16): ±0.1 % → negligible SE error
+- EAF (float16): ±0.1 % → negligible SE error
 
 ---
 
@@ -303,7 +285,14 @@ Optional FORMAT fields (used when present):
 - `EZ` — pre-computed z-score (preferred over ES/SE ratio)
 - `SS` — per-variant sample size
 
-Variant matching: by VCF `ID` field (default) or `CHROM:POS:REF:ALT`.
+**Variant matching:** by position (CHROM:POS), then allele pair (REF, ALT).
+The VCF `ID` field (rsID) is not used.  When the VCF has genome-ref REF > ALT
+alphabetically (non-canonical orientation), the z-score is negated so that the
+stored value always reflects the effect of A2 (the alphabetically-second allele).
+
+**bcftools pre-filter:** when the VCF has a CSI or TBI index, `bcftools view -R`
+is used to restrict the file to queried positions before parsing.  Falls back
+to a full cyvcf2 scan if bcftools is unavailable or the index is absent.
 
 ---
 
@@ -326,9 +315,8 @@ maximise sequential I/O throughput on spinning disk and SSD alike.
 
 ```
 pleiodb build  OUTPUT_DIR \
-  --variants variants.tsv \   # id  chrom  pos  ref  alt
-  --traits   traits.tsv   \   # trait_id  /path/to/gwas.vcf.gz
-  --raf      raf.tsv       \   # variant_id  raf  (optional)
+  --variants variants.tsv \   # ALID  EAF  (CHROM:POS_A1_A2, alphabetical alleles)
+  --traits   traits.tsv   \   # trait_id  trait_name  vcf_path  [build]
   --workers  16            \
   --chunk-v  512  --chunk-t 512
 ```

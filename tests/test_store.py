@@ -12,7 +12,7 @@ import pytest
 from pleiodb.store import ChunkedMatrix
 from pleiodb.quantize import (
     encode_z, decode_z, encode_neff, decode_neff,
-    encode_raf, decode_raf, reconstruct_beta_se,
+    encode_eaf, decode_eaf, reconstruct_beta_se,
     Z_NA, NEFF_NA,
 )
 
@@ -74,15 +74,15 @@ class TestReconstructBetaSE:
     def test_reconstruction(self):
         beta_true = np.array([0.05, -0.1], dtype=np.float32)
         se_true = np.array([0.01, 0.02], dtype=np.float32)
-        raf = np.array([0.4, 0.3], dtype=np.float32)
+        eaf = np.array([0.4, 0.3], dtype=np.float32)
         # Neff = 1 / (2 * p * (1-p) * se^2)
-        neff = 1.0 / (2.0 * raf * (1.0 - raf) * se_true**2)
+        neff = 1.0 / (2.0 * eaf * (1.0 - eaf) * se_true**2)
         z = beta_true / se_true
 
         beta_r, se_r = reconstruct_beta_se(
             z.reshape(2, 1),
             neff.reshape(2, 1),
-            raf,
+            eaf,
         )
         np.testing.assert_allclose(se_r[:, 0], se_true, rtol=0.001)
         np.testing.assert_allclose(beta_r[:, 0], beta_true, rtol=0.01)

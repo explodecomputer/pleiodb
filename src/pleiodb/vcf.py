@@ -1,10 +1,14 @@
 """
 GWAS-VCF reader.  Extracts z-scores and effective sample sizes for a
-pre-specified variant list.
+pre-specified variant list using positional matching (CHROM:POS → allele check).
 
 Follows the GWAS-VCF spec (Lyon et al. 2021):
   FORMAT fields: ES (effect size), SE (standard error), SS (sample size)
-  Optional:       EZ (pre-computed z-score), LP (−log10 p)
+  Optional:       EZ (pre-computed z-score)
+
+Allele convention: effect allele = A2 (alphabetically second).  When the VCF
+record has genome-ref REF > ALT alphabetically (non-canonical orientation),
+the z-score is negated so it reflects the effect of A2.
 """
 
 from __future__ import annotations
@@ -14,7 +18,6 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
@@ -28,155 +31,177 @@ def _open_vcf(path: str):
         import cyvcf2  # type: ignore
         return cyvcf2.VCF(path)
     except ImportError:
-        raise ImportError("cyvcf2 is required for reading GWAS-VCF files: pip install cyvcf2")
+        raise ImportError("cyvcf2 is required: install via conda (bioconda channel)")
 
 
-def _variant_key(chrom: str, pos: int, ref: str, alt: str) -> str:
-    return f"{chrom}:{pos}:{ref}:{alt}"
+def _has_index(vcf_path: str) -> bool:
+    return Path(vcf_path + ".csi").exists() or Path(vcf_path + ".tbi").exists()
+
+
+def _build_regions_file(pos_lookup: dict[str, list]) -> str:
+    """Write a CHROM-POS TSV temp file from pos_lookup keys for bcftools -R."""
+    seen: set[tuple[str, int]] = set()
+    for key in pos_lookup:
+        chrom, pos_str = key.split(":", 1)
+        chrom_bare = chrom.lstrip("chr")
+        seen.add((chrom_bare, int(pos_str)))
+
+    def _sort_key(cp: tuple[str, int]):
+        try:
+            return (int(cp[0]), cp[1])
+        except ValueError:
+            return (999, cp[1])
+
+    rows = sorted(seen, key=_sort_key)
+    fd, path = tempfile.mkstemp(suffix=".tsv", prefix="pleiodb_regions_")
+    with os.fdopen(fd, "w") as fh:
+        for chrom, pos in rows:
+            fh.write(f"{chrom}\t{pos}\n")
+            fh.write(f"chr{chrom}\t{pos}\n")
+    return path
 
 
 def read_vcf(
     vcf_path: str | Path,
-    variant_ids: Sequence[str],
-    id_col: str = "ID",
-    key_lookup: dict[str, int] | None = None,
+    pos_lookup: dict[str, list[tuple[str, str, int]]],
     regions_file: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Parse a GWAS-VCF file and return (z_scores, neff) float32 arrays aligned
-    to `variant_ids`.  Missing entries are NaN.
+    Parse a GWAS-VCF and return (z_scores, neff) float32 arrays aligned to the
+    variant list encoded in *pos_lookup*.
 
     Parameters
     ----------
-    vcf_path     : path to (possibly bgzipped + tabix-indexed) GWAS-VCF
-    variant_ids  : ordered list of variant identifiers to extract
-    id_col       : "ID" to match on VCF ID field, or "CHRPOSREFALT" to
-                   match on chr:pos:ref:alt key.  Ignored when key_lookup is
-                   provided.
-    key_lookup   : optional pre-built mapping of 'chrom:pos:ref:alt' (in the
-                   VCF's own coordinate system) → index into variant_ids.
-                   Supply this when the variant list and VCF are on different
-                   genome builds (positions already lifted by the caller).
-    regions_file : optional path to a CHROM-POS TSV for bcftools -R pre-filter.
-                   Requires bcftools on PATH and a tabix-indexed VCF; falls back
-                   to full-scan if bcftools fails.
+    vcf_path    : path to (bgzipped + CSI/TBI-indexed) GWAS-VCF
+    pos_lookup  : ``{chrom:pos → [(a1, a2, row_idx), ...]}`` — both bare and
+                  chr-prefixed chromosome forms should be present.  Built from
+                  the ALID variant list (direct coords) or from make_lifted_lookup
+                  (liftover coords).
+    regions_file : pre-built CHROM-POS TSV for bcftools -R.  If None, a temp
+                  file is built from pos_lookup keys and used when the VCF has
+                  a CSI or TBI index.  Falls back to full cyvcf2 scan on any
+                  bcftools failure.
+
+    Returns
+    -------
+    z_out, neff_out : float32 arrays, length = max(row_idx)+1 across all
+                      pos_lookup entries.  Missing entries remain NaN.
     """
     path = str(vcf_path)
-    n = len(variant_ids)
+    n = max((idx for entries in pos_lookup.values() for _, _, idx in entries),
+            default=-1) + 1
+    if n == 0:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
     z_out = np.full(n, _MISSING, dtype=np.float32)
     neff_out = np.full(n, _MISSING, dtype=np.float32)
 
-    if key_lookup is not None:
-        lookup = key_lookup
-    else:
-        lookup = {vid: i for i, vid in enumerate(variant_ids)}
-
+    own_regions_file = False
     tmp_vcf: str | None = None
-    if regions_file is not None:
-        fd, tmp_vcf = tempfile.mkstemp(suffix=".vcf")
-        os.close(fd)
-        try:
-            subprocess.run(
-                ["bcftools", "view", "-R", regions_file, "-Ov", path, "-o", tmp_vcf],
-                check=True,
-                stderr=subprocess.DEVNULL,
-            )
-            vcf = _open_vcf(tmp_vcf)
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            log.warning("bcftools pre-filter failed (%s), falling back to full VCF scan", exc)
-            os.unlink(tmp_vcf)
-            tmp_vcf = None
-            vcf = _open_vcf(path)
-    else:
-        vcf = _open_vcf(path)
 
-    seen = 0
+    try:
+        # --- bcftools pre-filter -------------------------------------------
+        if regions_file is None and _has_index(path):
+            regions_file = _build_regions_file(pos_lookup)
+            own_regions_file = True
 
-    for rec in vcf:
-        if key_lookup is not None:
-            key = _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
-        elif id_col == "ID":
-            key = rec.ID or _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
+        if regions_file is not None:
+            fd, tmp_vcf = tempfile.mkstemp(suffix=".vcf")
+            os.close(fd)
+            try:
+                subprocess.run(
+                    ["bcftools", "view", "-R", regions_file, "-Ov", path, "-o", tmp_vcf],
+                    check=True,
+                    stderr=subprocess.DEVNULL,
+                )
+                vcf = _open_vcf(tmp_vcf)
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                log.debug("bcftools pre-filter failed (%s), falling back to full scan", exc)
+                if tmp_vcf and os.path.exists(tmp_vcf):
+                    os.unlink(tmp_vcf)
+                tmp_vcf = None
+                vcf = _open_vcf(path)
         else:
-            key = _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
+            vcf = _open_vcf(path)
 
-        idx = lookup.get(key)
-        if idx is None:
-            continue
+        # --- iterate and match by position + alleles -----------------------
+        for rec in vcf:
+            chrom = rec.CHROM
+            key = f"{chrom}:{rec.POS}"
+            candidates = pos_lookup.get(key)
+            if not candidates:
+                continue
 
-        # --- z-score ---
-        try:
-            ez = rec.format("EZ")
-            if ez is not None and not np.isnan(ez[0][0]):
-                z_out[idx] = float(ez[0][0])
-            else:
-                es = rec.format("ES")
-                se = rec.format("SE")
-                if es is not None and se is not None:
-                    es_v, se_v = float(es[0][0]), float(se[0][0])
-                    if se_v > 0:
-                        z_out[idx] = es_v / se_v
-        except (TypeError, IndexError, ValueError):
-            pass
+            vcf_ref = rec.REF
+            vcf_alt = rec.ALT[0] if rec.ALT else None
+            if vcf_alt is None:
+                continue
 
-        # --- effective sample size ---
-        try:
-            ss = rec.format("SS")
-            if ss is not None:
-                neff_out[idx] = float(ss[0][0])
-            else:
-                ns = rec.INFO.get("NS")
-                if ns:
-                    neff_out[idx] = float(ns)
-        except (TypeError, AttributeError, ValueError):
-            pass
+            for a1, a2, idx in candidates:
+                if vcf_ref == a1 and vcf_alt == a2:
+                    flip = False
+                elif vcf_ref == a2 and vcf_alt == a1:
+                    flip = True
+                else:
+                    continue  # allele mismatch — silent NaN
 
-        seen += 1
-        if seen == n:
-            break
+                z = _extract_z(rec)
+                if z is not None:
+                    z_out[idx] = -z if flip else z
 
-    vcf.close()
-    if tmp_vcf is not None:
-        try:
-            os.unlink(tmp_vcf)
-        except OSError:
-            pass
+                neff = _extract_neff(rec)
+                if neff is not None:
+                    neff_out[idx] = neff
+
+        vcf.close()
+
+    finally:
+        if tmp_vcf and os.path.exists(tmp_vcf):
+            try:
+                os.unlink(tmp_vcf)
+            except OSError:
+                pass
+        if own_regions_file and regions_file and os.path.exists(regions_file):
+            try:
+                os.unlink(regions_file)
+            except OSError:
+                pass
+
     return z_out, neff_out
 
 
-def read_vcf_region(
-    vcf_path: str | Path,
-    variant_ids: Sequence[str],
-    region: str,
-    id_col: str = "ID",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Like read_vcf but restricts to a tabix region string 'chr:start-end'."""
-    path = str(vcf_path)
-    n = len(variant_ids)
-    z_out = np.full(n, _MISSING, dtype=np.float32)
-    neff_out = np.full(n, _MISSING, dtype=np.float32)
-    lookup: dict[str, int] = {vid: i for i, vid in enumerate(variant_ids)}
+def _extract_z(rec) -> float | None:
+    try:
+        ez = rec.format("EZ")
+        if ez is not None:
+            v = float(ez[0][0])
+            if not np.isnan(v):
+                return v
+    except (TypeError, IndexError, ValueError):
+        pass
+    try:
+        es = rec.format("ES")
+        se = rec.format("SE")
+        if es is not None and se is not None:
+            es_v, se_v = float(es[0][0]), float(se[0][0])
+            if se_v > 0:
+                return es_v / se_v
+    except (TypeError, IndexError, ValueError):
+        pass
+    return None
 
-    vcf = _open_vcf(path)
-    for rec in vcf(region):
-        key = rec.ID if id_col == "ID" else _variant_key(rec.CHROM, rec.POS, rec.REF, rec.ALT[0])
-        idx = lookup.get(key)
-        if idx is None:
-            continue
-        try:
-            es = rec.format("ES")
-            se = rec.format("SE")
-            if es is not None and se is not None:
-                es_v, se_v = float(es[0][0]), float(se[0][0])
-                if se_v > 0:
-                    z_out[idx] = es_v / se_v
-        except (TypeError, IndexError, ValueError):
-            pass
-        try:
-            ss = rec.format("SS")
-            if ss is not None:
-                neff_out[idx] = float(ss[0][0])
-        except (TypeError, ValueError):
-            pass
-    vcf.close()
-    return z_out, neff_out
+
+def _extract_neff(rec) -> float | None:
+    try:
+        ss = rec.format("SS")
+        if ss is not None:
+            return float(ss[0][0])
+    except (TypeError, ValueError):
+        pass
+    try:
+        ns = rec.INFO.get("NS")
+        if ns:
+            return float(ns)
+    except (TypeError, AttributeError, ValueError):
+        pass
+    return None
