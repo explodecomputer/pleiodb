@@ -1,0 +1,5 @@
+ukb-b-19953	Body mass index	tests/test_data/vcf/ukb-b-19953.vcf.gz
+ieu-a-7	Coronary artery disease	tests/test_data/vcf/ieu-a-7.vcf.gz
+ukb-b-10787	Height	tests/test_data/vcf/ukb-b-10787.vcf.gz
+ieu-b-110	LDL cholesterol	tests/test_data/vcf/ieu-b-110.vcf.gz
+ieu-b-109	HDL cholesterol	tests/test_data/vcf/ieu-b-109.vcf.gz

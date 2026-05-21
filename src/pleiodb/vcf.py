@@ -10,6 +10,9 @@ Follows the GWAS-VCF spec (Lyon et al. 2021):
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -37,6 +40,7 @@ def read_vcf(
     variant_ids: Sequence[str],
     id_col: str = "ID",
     key_lookup: dict[str, int] | None = None,
+    regions_file: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Parse a GWAS-VCF file and return (z_scores, neff) float32 arrays aligned
@@ -44,15 +48,18 @@ def read_vcf(
 
     Parameters
     ----------
-    vcf_path    : path to (possibly bgzipped + tabix-indexed) GWAS-VCF
-    variant_ids : ordered list of variant identifiers to extract
-    id_col      : "ID" to match on VCF ID field, or "CHRPOSREFALT" to
-                  match on chr:pos:ref:alt key.  Ignored when key_lookup is
-                  provided.
-    key_lookup  : optional pre-built mapping of 'chrom:pos:ref:alt' (in the
-                  VCF's own coordinate system) → index into variant_ids.
-                  Supply this when the variant list and VCF are on different
-                  genome builds (positions already lifted by the caller).
+    vcf_path     : path to (possibly bgzipped + tabix-indexed) GWAS-VCF
+    variant_ids  : ordered list of variant identifiers to extract
+    id_col       : "ID" to match on VCF ID field, or "CHRPOSREFALT" to
+                   match on chr:pos:ref:alt key.  Ignored when key_lookup is
+                   provided.
+    key_lookup   : optional pre-built mapping of 'chrom:pos:ref:alt' (in the
+                   VCF's own coordinate system) → index into variant_ids.
+                   Supply this when the variant list and VCF are on different
+                   genome builds (positions already lifted by the caller).
+    regions_file : optional path to a CHROM-POS TSV for bcftools -R pre-filter.
+                   Requires bcftools on PATH and a tabix-indexed VCF; falls back
+                   to full-scan if bcftools fails.
     """
     path = str(vcf_path)
     n = len(variant_ids)
@@ -64,7 +71,25 @@ def read_vcf(
     else:
         lookup = {vid: i for i, vid in enumerate(variant_ids)}
 
-    vcf = _open_vcf(path)
+    tmp_vcf: str | None = None
+    if regions_file is not None:
+        fd, tmp_vcf = tempfile.mkstemp(suffix=".vcf")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["bcftools", "view", "-R", regions_file, "-Ov", path, "-o", tmp_vcf],
+                check=True,
+                stderr=subprocess.DEVNULL,
+            )
+            vcf = _open_vcf(tmp_vcf)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            log.warning("bcftools pre-filter failed (%s), falling back to full VCF scan", exc)
+            os.unlink(tmp_vcf)
+            tmp_vcf = None
+            vcf = _open_vcf(path)
+    else:
+        vcf = _open_vcf(path)
+
     seen = 0
 
     for rec in vcf:
@@ -111,6 +136,11 @@ def read_vcf(
             break
 
     vcf.close()
+    if tmp_vcf is not None:
+        try:
+            os.unlink(tmp_vcf)
+        except OSError:
+            pass
     return z_out, neff_out
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Sequence
@@ -95,10 +96,40 @@ def _load_trait_list(trait_tsv: str | Path) -> list[tuple[str, str, str, str | N
     return pairs
 
 
+def _make_regions_file(key_lookup: dict) -> str:
+    """Build a sorted CHROM-POS TSV for bcftools -R from a liftover key_lookup.
+
+    Both bare (1) and chr-prefixed (chr1) forms are included so the file works
+    regardless of the VCF's chromosome naming convention.
+    """
+    seen: set[tuple[str, int]] = set()
+    for key in key_lookup:
+        parts = key.split(":")
+        seen.add((parts[0], int(parts[1])))
+
+    def _sort_key(cp: tuple[str, int]):
+        chrom = cp[0].lstrip("chr")
+        try:
+            return (int(chrom), cp[1])
+        except ValueError:
+            return (999, cp[1])
+
+    rows = sorted(seen, key=_sort_key)
+    fd, path = tempfile.mkstemp(suffix=".tsv", prefix="pleiodb_regions_")
+    with os.fdopen(fd, "w") as fh:
+        for chrom, pos in rows:
+            fh.write(f"{chrom}\t{pos}\n")
+    log.info("Regions file: %d positions → %s", len(rows), path)
+    return path
+
+
 def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
     """Worker: read one VCF and return (local_t_idx, z, neff)."""
-    local_t_idx, vcf_path, variant_ids, key_lookup = args
-    z, neff = read_vcf(vcf_path, variant_ids, key_lookup=key_lookup)
+    local_t_idx, trait_id, vcf_path, variant_ids, key_lookup, regions_file = args
+    log.info("  reading %-30s  %s", trait_id, vcf_path)
+    z, neff = read_vcf(vcf_path, variant_ids, key_lookup=key_lookup, regions_file=regions_file)
+    n_hit = int(np.isfinite(z).sum())
+    log.info("  done    %-30s  %d/%d variants matched", trait_id, n_hit, len(variant_ids))
     return local_t_idx, z, neff
 
 
@@ -142,6 +173,7 @@ def build_database(
     # Pre-compute liftover lookups for each unique vcf_build that differs from
     # the canonical variants build.  Shared across traits in the same build.
     _lifted_cache: dict[str, dict[str, int]] = {}
+    _regions_cache: dict[str, str] = {}  # vcf_build_norm → temp regions file path
 
     def _key_lookup_for(vcf_build: str | None) -> dict[str, int] | None:
         if canon_build is None or vcf_build is None:
@@ -154,6 +186,15 @@ def build_database(
                 variants, from_build=canon_build, to_build=vcf_build_norm
             )
         return _lifted_cache[vcf_build_norm]
+
+    def _regions_file_for(vcf_build: str | None) -> str | None:
+        key_lk = _key_lookup_for(vcf_build)
+        if key_lk is None:
+            return None
+        vcf_build_norm = normalise_build(vcf_build)
+        if vcf_build_norm not in _regions_cache:
+            _regions_cache[vcf_build_norm] = _make_regions_file(key_lk)
+        return _regions_cache[vcf_build_norm]
 
     # ---- Write variant / trait metadata -----------------------------------
     np.save(out / "variants.npy", variants)
@@ -180,15 +221,18 @@ def build_database(
         neff_block = np.full((V, B), np.nan, dtype=np.float32)
 
         args = [
-            (j, vcf_path, variant_ids, _key_lookup_for(vcf_build))
-            for j, (_, vcf_path, _, vcf_build) in enumerate(batch_traits)
+            (j, trait_id, vcf_path, variant_ids, _key_lookup_for(vcf_build), _regions_file_for(vcf_build))
+            for j, (trait_id, vcf_path, _, vcf_build) in enumerate(batch_traits)
         ]
+        n_done = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
             for fut in as_completed(futures):
                 j, z, neff = fut.result()
                 z_block[:, j] = z
                 neff_block[:, j] = neff
+                n_done += 1
+                log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
         # Accumulate Neff stats for neff_base
         valid = np.isfinite(neff_block)
@@ -219,7 +263,15 @@ def build_database(
         np.full(V, np.nan, dtype=np.float16).tofile(out / "raf.f16")
 
     # ---- Significance masks ----------------------------------------------
+    log.info("Building significance masks (%s)…", pval_thresholds)
     _build_masks(out, zscore_mat, V, T, pval_thresholds)
+
+    # ---- Clean up temp regions files -------------------------------------
+    for rf in _regions_cache.values():
+        try:
+            os.unlink(rf)
+        except OSError:
+            pass
 
     # ---- Write metadata ---------------------------------------------------
     meta = {
@@ -269,7 +321,7 @@ def _build_masks(
                         (hv + v_off).astype(np.uint32),
                         (ht + t_off).astype(np.uint32),
                     ))
-        log.debug("mask scan: v-block %d/%d", vi + 1, zscore_mat.n_v_chunks)
+        log.info("mask scan: v-block %d/%d", vi + 1, zscore_mat.n_v_chunks)
 
     for p, batches in hits.items():
         if batches:
