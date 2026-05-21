@@ -12,4 +12,4 @@ dependencies:
   - pip
   - pip:
     - pyliftover>=0.4       # coordinate liftover (pure Python, pip is fine)
-    - -e .                  # install pleiodb itself in editable mode
+    - -e ".[dev]"           # install pleiodb + dev extras (pytest etc.)

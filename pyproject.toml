@@ -9,6 +9,7 @@ description = "Compact storage and query tool for large-scale GWAS summary stati
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
+    "scipy>=1.9",
     "zstandard>=0.21",
     "click>=8.0",
     "cyvcf2>=0.30",
