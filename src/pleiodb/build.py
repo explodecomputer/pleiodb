@@ -5,12 +5,19 @@ Variant input format (tab-separated, no header):
     ALID  EAF
     e.g.  10:101558746_G_T  0.56079
 
-    ALID = CHROM:POS_A1_A2 where A1 < A2 alphabetically.
+    ALID = CHROM:POS_A1_A2 where A1 ≤ A2 alphabetically (canonical order).
     EAF  = frequency of the effect allele (A2).  Second column is optional;
            omit or use NaN when frequencies are unavailable.
+    Alleles longer than 20 characters are compressed to
+    ``{allele[:8]}~{sha256(allele)[:4]}`` (see :mod:`pleiodb.alid`).
 
-Trait TSV format (tab-separated, no header):
-    trait_id  trait_name  vcf_path  [build]
+Trait TSV format (tab-separated, **with header row**):
+    trait_id  trait_name  N  [K]  vcf_path  [build]
+
+    N      = total sample size (integer, required).
+    K      = case fraction in (0, 1), required for binary traits.
+             Absent or empty → trait treated as continuous.
+    build  = genome build of the VCF (hg19 / hg38); optional.
 
 Processing strategy:
   Traits are processed in batches of T_BATCH.  Within each batch, VCF files
@@ -25,12 +32,14 @@ import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import zstandard as zstd
 
+from .alid import canonical_alid, compress_allele
 from .quantize import encode_z, encode_neff, encode_eaf, Z_NA
 from .store import ChunkedMatrix
 from .vcf import read_vcf
@@ -40,6 +49,114 @@ log = logging.getLogger(__name__)
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
 
 DEFAULT_CHUNK = (512, 512)
+
+
+# ---------------------------------------------------------------------------
+# Trait metadata
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TraitInfo:
+    """Per-trait metadata loaded from the traits input TSV."""
+    trait_id: str
+    trait_name: str
+    N: int              # total sample size (required)
+    K: float | None     # case fraction in (0, 1); None = continuous trait
+    vcf_path: str
+    vcf_build: str | None
+
+
+def load_trait_list(trait_tsv: str | Path) -> list[TraitInfo]:
+    """Parse the traits input TSV and return a list of :class:`TraitInfo`.
+
+    File format (tab-separated, **with header row**):
+
+    .. code-block:: text
+
+        trait_id  trait_name  N  [K]  vcf_path  [build]
+
+    Column rules
+    ------------
+    - Header is required; columns are identified by name, not position.
+    - ``N`` (integer sample size) is required for every trait.
+    - ``K`` (case fraction) is optional: if the column is absent or the cell
+      is empty the trait is treated as continuous (``K=None``).
+    - ``K`` must be strictly inside the open interval (0, 1).
+    - ``build`` is optional.
+    - Lines starting with ``#`` and blank lines are silently skipped.
+    """
+    path = Path(trait_tsv)
+    header: list[str] | None = None
+    traits: list[TraitInfo] = []
+
+    with open(path) as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if header is None:
+                # First non-blank, non-comment line is the header
+                header = [col.strip() for col in line.split("\t")]
+                if "N" not in header:
+                    raise ValueError(
+                        f"traits TSV {path} is missing required 'N' column "
+                        f"(found columns: {header})"
+                    )
+                continue
+
+            cells = [c.strip() for c in line.split("\t")]
+            row: dict[str, str] = dict(zip(header, cells))
+
+            trait_id = row.get("trait_id", "")
+            trait_name = row.get("trait_name", "")
+            vcf_path = row.get("vcf_path", "")
+            vcf_build_raw = row.get("build", "")
+            vcf_build = vcf_build_raw if vcf_build_raw else None
+
+            # --- N (required) ---
+            n_raw = row.get("N", "").strip()
+            if not n_raw:
+                raise ValueError(
+                    f"Trait '{trait_id}' has an empty N value in {path}"
+                )
+            try:
+                N = int(n_raw)
+            except ValueError:
+                raise ValueError(
+                    f"Trait '{trait_id}' has non-integer N value '{n_raw}' in {path}"
+                )
+
+            # --- K (optional) ---
+            k_raw = row.get("K", "").strip() if "K" in header else ""
+            K: float | None
+            if k_raw:
+                try:
+                    K = float(k_raw)
+                except ValueError:
+                    raise ValueError(
+                        f"Trait '{trait_id}' has non-numeric K value '{k_raw}' in {path}"
+                    )
+                if not (0.0 < K < 1.0):
+                    raise ValueError(
+                        f"Trait '{trait_id}' has K={K} outside (0, 1) in {path}"
+                    )
+            else:
+                K = None
+
+            traits.append(TraitInfo(
+                trait_id=trait_id,
+                trait_name=trait_name,
+                N=N,
+                K=K,
+                vcf_path=vcf_path,
+                vcf_build=vcf_build,
+            ))
+
+    if header is None:
+        raise ValueError(f"traits TSV {path} appears to be empty")
+
+    return traits
 DEFAULT_T_BATCH = 512
 DEFAULT_WORKERS = 8
 DEFAULT_PVAL_THRESHOLDS = [5e-8, 1e-5]
@@ -49,12 +166,11 @@ DEFAULT_PVAL_THRESHOLDS = [5e-8, 1e-5]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_alid(alid: str) -> tuple[str, int, str, str]:
-    """Parse 'CHROM:POS_A1_A2' → (chrom, pos, a1, a2).
+def _parse_raw_alid(alid: str) -> tuple[str, int, str, str]:
+    """Parse 'CHROM:POS_A1_A2' → (chrom, pos, raw_a1, raw_a2) without canonicalisation.
 
-    Normalises to canonical orientation (a1 < a2 alphabetically) on the fly.
-    Returns alleles in canonical order; the caller is responsible for flipping
-    EAF when normalisation was applied.
+    The returned alleles are in the original input order; call
+    ``canonical_alid`` to obtain the canonical form and flip flag.
     """
     colon_idx = alid.index(":")
     chrom = alid[:colon_idx]
@@ -63,11 +179,7 @@ def _parse_alid(alid: str) -> tuple[str, int, str, str]:
     if len(parts) != 3:
         raise ValueError(f"Cannot parse ALID: {alid!r}  (expected CHROM:POS_A1_A2)")
     pos = int(parts[0])
-    raw_a1, raw_a2 = parts[1], parts[2]
-    if raw_a1 <= raw_a2:
-        return chrom, pos, raw_a1, raw_a2
-    else:
-        return chrom, pos, raw_a2, raw_a1  # caller must flip EAF
+    return chrom, pos, parts[1], parts[2]
 
 
 def _load_variants(
@@ -85,8 +197,8 @@ def _load_variants(
         ("id",    "U64"),
         ("chrom", "U10"),
         ("pos",   np.uint32),
-        ("a1",    "U512"),
-        ("a2",    "U512"),
+        ("a1",    "U64"),   # compressed alleles are at most 13 chars; 64 is generous
+        ("a2",    "U64"),
     ])
     rows = []
     eaf_list = []
@@ -99,43 +211,19 @@ def _load_variants(
             raw_alid = parts[0]
             raw_eaf = float(parts[1]) if len(parts) > 1 and parts[1].strip() else np.nan
 
-            chrom, pos, a1, a2 = _parse_alid(raw_alid)
-            canonical_alid = f"{chrom}:{pos}_{a1}_{a2}"
-            # If alleles were flipped during normalisation, flip EAF too
-            was_flipped = (raw_alid != canonical_alid and
-                           raw_alid.split(":", 1)[1].split("_", 1)[1] != f"{a1}_{a2}")
+            chrom, pos, raw_a1, raw_a2 = _parse_raw_alid(raw_alid)
+            alid_str, was_flipped = canonical_alid(chrom, pos, raw_a1, raw_a2)
+            # Extract compressed alleles from the canonical ALID string
+            _, allele_part = alid_str.split(":", 1)
+            _, ca1, ca2 = allele_part.split("_", 2)
             eaf = (1.0 - raw_eaf) if (was_flipped and not np.isnan(raw_eaf)) else raw_eaf
 
-            rows.append((canonical_alid, chrom, pos, a1, a2))
+            rows.append((alid_str, chrom, pos, ca1, ca2))
             eaf_list.append(eaf)
 
     return np.array(rows, dtype=dt), np.array(eaf_list, dtype=np.float32)
 
 
-def _load_trait_list(
-    trait_tsv: str | Path,
-) -> list[tuple[str, str, str, str | None]]:
-    """
-    Returns list of (trait_id, vcf_path, trait_name, vcf_build_or_None).
-
-    TSV columns (tab-separated, no header):
-        1  trait_id    required
-        2  trait_name  optional (empty string if absent)
-        3  vcf_path    required
-        4  build       optional (hg19 / hg38 / GRCh37 / GRCh38)
-    """
-    pairs = []
-    with open(trait_tsv) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("\t")
-            trait_name = parts[1].strip() if len(parts) > 1 else ""
-            vcf_path = parts[2].strip() if len(parts) > 2 else ""
-            vcf_build = parts[3].strip() if len(parts) > 3 and parts[3].strip() else None
-            pairs.append((parts[0], vcf_path, trait_name, vcf_build))
-    return pairs
 
 
 def _build_pos_lookup(
@@ -219,7 +307,7 @@ def build_database(
     (out / "masks").mkdir(exist_ok=True)
 
     variants, eaf = _load_variants(variants_path)
-    trait_pairs = _load_trait_list(trait_tsv)
+    trait_pairs = load_trait_list(trait_tsv)
     V = len(variants)
     T = len(trait_pairs)
     CV, CT = chunk_shape
@@ -257,7 +345,7 @@ def build_database(
     np.save(out / "variants.npy", variants)
     trait_dt = np.dtype([("id", "U64"), ("name", "U256")])
     trait_arr = np.array(
-        [(tid, name) for tid, _, name, _ in trait_pairs], dtype=trait_dt
+        [(t.trait_id, t.trait_name) for t in trait_pairs], dtype=trait_dt
     )
     np.save(out / "traits.npy", trait_arr)
 
@@ -280,8 +368,8 @@ def build_database(
         neff_block = np.full((V, B), np.nan, dtype=np.float32)
 
         args = [
-            (j, trait_id, vcf_path, *_lookup_for(vcf_build), V)
-            for j, (trait_id, vcf_path, _, vcf_build) in enumerate(batch_traits)
+            (j, t.trait_id, t.vcf_path, *_lookup_for(t.vcf_build), V)
+            for j, t in enumerate(batch_traits)
         ]
         n_done = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
