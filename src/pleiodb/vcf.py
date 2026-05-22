@@ -21,6 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .alid import compress_allele
+
 log = logging.getLogger(__name__)
 
 _MISSING = np.nan
@@ -132,10 +134,11 @@ def read_vcf(
             if not candidates:
                 continue
 
-            vcf_ref = rec.REF
-            vcf_alt = rec.ALT[0] if rec.ALT else None
-            if vcf_alt is None:
+            vcf_ref = compress_allele(rec.REF)
+            vcf_alt_raw = rec.ALT[0] if rec.ALT else None
+            if vcf_alt_raw is None:
                 continue
+            vcf_alt = compress_allele(vcf_alt_raw)
 
             for a1, a2, idx in candidates:
                 if vcf_ref == a1 and vcf_alt == a2:
