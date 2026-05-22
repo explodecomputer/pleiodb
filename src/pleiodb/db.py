@@ -3,12 +3,11 @@ GWASDatabase — top-level handle that owns all sub-matrices and metadata.
 
 Directory layout:
   {name}.pleiodb/
-    meta.json          — dimensions, chunk sizes, dtypes, thresholds
-    variants.npy       — structured array: id(U64), chrom(U10), pos(u4), a1(U512), a2(U512)
+    meta.json          — dimensions, chunk sizes, dtypes, thresholds, var_y per trait
+    variants.tsv       — V rows + header: alid, eaf  (replaces variants.npy + eaf.f16)
     traits.npy         — structured array: id(U64), name(U256)
     zscore.bin/.cidx   — V×T  int16  (z * 100, NA = -32768)
     neff.bin/.cidx     — V×T  uint16 (log2-encoded, NA = 0xFFFF)
-    eaf.f16            — V    float16  effect allele frequency (A2)
     lambda.bin/.cidx   — T×T  float16 (symmetric)
     masks/
       {thr}.coo.zst    — COO-format significance hits: sorted (v_idx u4, t_idx u4) pairs
@@ -25,6 +24,7 @@ from typing import Sequence
 import numpy as np
 import zstandard as zstd
 
+from .alid import parse_alid
 from .store import ChunkedMatrix
 from .quantize import (
     decode_z, decode_neff, decode_eaf,
@@ -34,6 +34,48 @@ from .quantize import (
 
 _DCTX = zstd.ZstdDecompressor()
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
+
+_VARIANTS_DT = np.dtype([
+    ("id",    "U64"),
+    ("chrom", "U10"),
+    ("pos",   np.uint32),
+    ("a1",    "U64"),
+    ("a2",    "U64"),
+])
+
+
+def _load_variants_tsv(
+    path: "Path",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Parse ``variants.tsv`` → (variants structured array, eaf float32 array).
+
+    Shared by the ``variants`` and ``eaf`` properties; both are populated in a
+    single pass so the file is only read once.
+    """
+    rows = []
+    eaf_list = []
+    with open(path) as fh:
+        header_seen = False
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if not header_seen:
+                # First non-blank line is the header
+                header_seen = True
+                continue
+            parts = line.split("\t", 1)
+            alid = parts[0]
+            raw_eaf = parts[1].strip() if len(parts) > 1 else ""
+            eaf_val = float(raw_eaf) if raw_eaf else np.nan
+
+            chrom, pos, a1, a2 = parse_alid(alid)
+            rows.append((alid, chrom, pos, a1, a2))
+            eaf_list.append(eaf_val)
+
+    variants = np.array(rows, dtype=_VARIANTS_DT)
+    eaf = np.array(eaf_list, dtype=np.float32)
+    return variants, eaf
 
 
 class GWASDatabase:
@@ -86,10 +128,16 @@ class GWASDatabase:
     def T(self) -> int:
         return self._meta["T"]
 
+    def _ensure_variants_loaded(self) -> None:
+        """Load variants.tsv once, populating both _variants and _eaf caches."""
+        if self._variants is None:
+            self._variants, self._eaf = _load_variants_tsv(
+                self.path / "variants.tsv"
+            )
+
     @property
     def variants(self) -> np.ndarray:
-        if self._variants is None:
-            self._variants = np.load(self.path / "variants.npy", allow_pickle=False)
+        self._ensure_variants_loaded()
         return self._variants
 
     @property
@@ -100,9 +148,7 @@ class GWASDatabase:
 
     @property
     def eaf(self) -> np.ndarray:
-        if self._eaf is None:
-            raw = np.fromfile(self.path / "eaf.f16", dtype=np.float16)
-            self._eaf = decode_eaf(raw)
+        self._ensure_variants_loaded()
         return self._eaf
 
     @property

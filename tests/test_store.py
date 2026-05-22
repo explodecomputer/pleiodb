@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pleiodb.alid import compress_allele, is_compressed, canonical_alid
+from pleiodb.alid import compress_allele, is_compressed, canonical_alid, parse_alid
 from pleiodb.build import TraitInfo, load_trait_list
 from pleiodb.store import ChunkedMatrix
 from pleiodb.quantize import (
@@ -366,3 +366,146 @@ class TestLoadTraitList:
         """)
         with pytest.raises(ValueError, match="[Kk]"):
             load_trait_list(tsv)
+
+
+# ---------------------------------------------------------------------------
+# ALID parser (issue #13 — needed by db.py to read variants.tsv)
+# ---------------------------------------------------------------------------
+
+class TestParseAlid:
+    """parse_alid returns raw (chrom, pos, a1, a2) without canonicalisation."""
+
+    def test_standard_snp(self):
+        chrom, pos, a1, a2 = parse_alid("1:100_A_T")
+        assert chrom == "1"
+        assert pos == 100
+        assert a1 == "A"
+        assert a2 == "T"
+
+    def test_chr_prefix_preserved(self):
+        chrom, pos, a1, a2 = parse_alid("chr22:1234567_C_G")
+        assert chrom == "chr22"
+        assert pos == 1234567
+        assert a1 == "C"
+        assert a2 == "G"
+
+    def test_compressed_allele_round_trips(self):
+        """A canonical ALID that contains a compressed allele must parse back."""
+        long_allele = "A" * 25
+        compressed = compress_allele(long_allele)   # e.g. "AAAAAAAA~xxxx"
+        alid = f"3:500_G_{compressed}"
+        chrom, pos, a1, a2 = parse_alid(alid)
+        assert chrom == "3"
+        assert pos == 500
+        assert a1 == "G"
+        assert a2 == compressed
+
+    def test_indel(self):
+        chrom, pos, a1, a2 = parse_alid("10:1206798_C_CAAT")
+        assert a1 == "C" and a2 == "CAAT"
+
+    def test_invalid_format_raises(self):
+        with pytest.raises(ValueError):
+            parse_alid("missing_colon")
+
+    def test_roundtrip_with_canonical_alid(self):
+        """canonical_alid → parse_alid must recover the same alleles."""
+        alid_str, _ = canonical_alid("7", 12345, "G", "ACGT")
+        _, _, a1, a2 = parse_alid(alid_str)
+        # canonical_alid compresses if needed — alleles should match compressed forms
+        assert a1 == compress_allele("ACGT") or a2 == compress_allele("ACGT")
+
+
+# ---------------------------------------------------------------------------
+# var_y estimation (issue #10)
+# ---------------------------------------------------------------------------
+
+from pleiodb.build import compute_neff_study, estimate_var_y
+
+
+class TestComputeNeffStudy:
+    def test_continuous_trait(self):
+        assert compute_neff_study(100_000, None) == 100_000
+
+    def test_continuous_large(self):
+        assert compute_neff_study(461_460, None) == 461_460
+
+    def test_binary_trait(self):
+        # 4 * N * K * (1 - K)
+        N, K = 60_801, 0.34
+        expected = 4 * N * K * (1 - K)
+        assert abs(compute_neff_study(N, K) - expected) < 1e-6
+
+    def test_binary_k_half_gives_n(self):
+        """K = 0.5 → Neff = 4 * N * 0.25 = N."""
+        assert abs(compute_neff_study(10_000, 0.5) - 10_000) < 1e-6
+
+
+class TestEstimateVarY:
+    def _make_arrays(self, n=500, var_y_true=1.0, neff_study=50_000, seed=42):
+        """Generate synthetic SE and EAF consistent with a given var_y."""
+        rng = np.random.default_rng(seed)
+        eaf = rng.uniform(0.05, 0.95, n).astype(np.float32)
+        # SE = sqrt(var_y / (2 * eaf * (1-eaf) * neff_study))
+        se = np.sqrt(var_y_true / (2 * eaf * (1 - eaf) * neff_study)).astype(np.float32)
+        return se, eaf
+
+    def test_returns_tuple(self):
+        se, eaf = self._make_arrays()
+        result = estimate_var_y(se, eaf, 50_000)
+        assert isinstance(result, tuple) and len(result) == 2
+
+    def test_continuous_trait_recovers_var_y(self):
+        """For normalised beta (var_y = 1), estimate ≈ 1.0."""
+        se, eaf = self._make_arrays(n=1000, var_y_true=1.0, neff_study=50_000)
+        var_y_est, n_used = estimate_var_y(se, eaf, 50_000)
+        assert n_used > 900
+        assert abs(var_y_est - 1.0) < 0.05, f"var_y = {var_y_est:.4f}, expected ≈ 1.0"
+
+    def test_binary_trait_recovers_var_y(self):
+        """For binary trait, var_y ≈ K*(1-K); Neff_study = 4*N*K*(1-K) handles it."""
+        K = 0.34
+        var_y_true = K * (1 - K)           # ≈ 0.2244
+        N = 60_000
+        neff_study = 4 * N * K * (1 - K)   # = 4*N*var_y_true
+        se, eaf = self._make_arrays(n=1000, var_y_true=var_y_true, neff_study=neff_study)
+        var_y_est, _ = estimate_var_y(se, eaf, neff_study)
+        assert abs(var_y_est - var_y_true) < 0.02, (
+            f"var_y = {var_y_est:.4f}, expected ≈ {var_y_true:.4f}"
+        )
+
+    def test_maf_filter_low_eaf(self):
+        """Variants with EAF < 0.01 must be excluded."""
+        rng = np.random.default_rng(0)
+        eaf = np.array([0.005, 0.5, 0.5], dtype=np.float32)   # first is too rare
+        se = np.full(3, 0.01, dtype=np.float32)
+        _, n_used = estimate_var_y(se, eaf, 10_000)
+        assert n_used == 2
+
+    def test_maf_filter_high_eaf(self):
+        """Variants with EAF > 0.99 must be excluded."""
+        eaf = np.array([0.5, 0.995, 0.5], dtype=np.float32)
+        se = np.full(3, 0.01, dtype=np.float32)
+        _, n_used = estimate_var_y(se, eaf, 10_000)
+        assert n_used == 2
+
+    def test_nan_se_excluded(self):
+        """Variants with NaN SE must not contribute."""
+        eaf = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        se = np.array([np.nan, 0.01, 0.01], dtype=np.float32)
+        _, n_used = estimate_var_y(se, eaf, 10_000)
+        assert n_used == 2
+
+    def test_zero_qualifying_variants_raises(self):
+        """All variants filtered → ValueError."""
+        eaf = np.array([0.001, 0.999], dtype=np.float32)   # both outside MAF window
+        se = np.full(2, 0.01, dtype=np.float32)
+        with pytest.raises(ValueError, match="[Vv]ariant"):
+            estimate_var_y(se, eaf, 10_000)
+
+    def test_n_variants_var_y_count(self):
+        """n_used must equal the number of contributing variants."""
+        eaf = np.array([0.1, 0.2, 0.3, 0.4, 0.005], dtype=np.float32)
+        se = np.full(5, 0.01, dtype=np.float32)
+        _, n_used = estimate_var_y(se, eaf, 10_000)
+        assert n_used == 4   # last one (EAF=0.005) excluded

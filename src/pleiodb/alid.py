@@ -41,6 +41,33 @@ def is_compressed(allele: str) -> bool:
     return "~" in allele
 
 
+def parse_alid(alid: str) -> tuple[str, int, str, str]:
+    """Parse an ALID string ``CHROM:POS_A1_A2`` → ``(chrom, pos, a1, a2)``.
+
+    The alleles are returned as-is (no canonicalisation, no decompression).
+    Compressed alleles (containing ``~``) are returned verbatim.
+
+    Raises :class:`ValueError` if the string is not in the expected format.
+    """
+    try:
+        colon_idx = alid.index(":")
+    except ValueError:
+        raise ValueError(f"Cannot parse ALID {alid!r}: missing ':'")
+    chrom = alid[:colon_idx]
+    rest = alid[colon_idx + 1:]
+    parts = rest.split("_", 2)
+    if len(parts) != 3:
+        raise ValueError(
+            f"Cannot parse ALID {alid!r}: expected CHROM:POS_A1_A2, "
+            f"got {len(parts)} underscore-separated parts after ':'"
+        )
+    try:
+        pos = int(parts[0])
+    except ValueError:
+        raise ValueError(f"Cannot parse ALID {alid!r}: POS '{parts[0]}' is not an integer")
+    return chrom, pos, parts[1], parts[2]
+
+
 def canonical_alid(
     chrom: str,
     pos: int,

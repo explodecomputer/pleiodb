@@ -39,7 +39,7 @@ from typing import Sequence
 import numpy as np
 import zstandard as zstd
 
-from .alid import canonical_alid, compress_allele
+from .alid import canonical_alid, compress_allele, parse_alid
 from .quantize import encode_z, encode_neff, encode_eaf, Z_NA
 from .store import ChunkedMatrix
 from .vcf import read_vcf
@@ -157,29 +157,81 @@ def load_trait_list(trait_tsv: str | Path) -> list[TraitInfo]:
         raise ValueError(f"traits TSV {path} appears to be empty")
 
     return traits
+
+
 DEFAULT_T_BATCH = 512
 DEFAULT_WORKERS = 8
 DEFAULT_PVAL_THRESHOLDS = [5e-8, 1e-5]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# var_y estimation helpers
 # ---------------------------------------------------------------------------
 
-def _parse_raw_alid(alid: str) -> tuple[str, int, str, str]:
-    """Parse 'CHROM:POS_A1_A2' → (chrom, pos, raw_a1, raw_a2) without canonicalisation.
+def compute_neff_study(N: int, K: float | None) -> float:
+    """Return the study-level effective sample size for a trait.
 
-    The returned alleles are in the original input order; call
-    ``canonical_alid`` to obtain the canonical form and flip flag.
+    Parameters
+    ----------
+    N : total sample size (integer)
+    K : case fraction in (0, 1) for binary traits; ``None`` for continuous
+
+    Returns
+    -------
+    float — Neff_study = N (continuous) or 4·N·K·(1−K) (binary)
     """
-    colon_idx = alid.index(":")
-    chrom = alid[:colon_idx]
-    rest = alid[colon_idx + 1:]
-    parts = rest.split("_", 2)
-    if len(parts) != 3:
-        raise ValueError(f"Cannot parse ALID: {alid!r}  (expected CHROM:POS_A1_A2)")
-    pos = int(parts[0])
-    return chrom, pos, parts[1], parts[2]
+    if K is None:
+        return float(N)
+    return 4.0 * N * K * (1.0 - K)
+
+
+def estimate_var_y(
+    se: np.ndarray,
+    eaf: np.ndarray,
+    neff_study: float,
+) -> tuple[float, int]:
+    """Estimate phenotypic variance var_y[t] from SE, EAF, and Neff_study.
+
+    For each variant v the per-variant estimate is::
+
+        hat_var_y[v] = SE[v]² × 2·EAF[v]·(1−EAF[v]) × Neff_study
+
+    var_y[t] is the median of hat_var_y over variants with:
+      * EAF ∈ (0.01, 0.99)
+      * non-NaN SE
+
+    Parameters
+    ----------
+    se          : float32 array, length V — per-variant SE from VCF
+    eaf         : float32 array, length V — effect allele frequency (A2)
+    neff_study  : float — study-level Neff (from :func:`compute_neff_study`)
+
+    Returns
+    -------
+    (var_y, n_variants_var_y) : (float, int)
+
+    Raises
+    ------
+    ValueError — if no variants pass the MAF and non-NaN SE filters
+    """
+    mask = (
+        np.isfinite(se) &
+        (eaf > 0.01) &
+        (eaf < 0.99)
+    )
+    n_used = int(mask.sum())
+    if n_used == 0:
+        raise ValueError(
+            "No variants with EAF ∈ (0.01, 0.99) and non-NaN SE — "
+            "cannot estimate var_y for this trait"
+        )
+    estimates = se[mask] ** 2 * 2.0 * eaf[mask] * (1.0 - eaf[mask]) * neff_study
+    return float(np.median(estimates)), n_used
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
 
 
 def _load_variants(
@@ -211,7 +263,7 @@ def _load_variants(
             raw_alid = parts[0]
             raw_eaf = float(parts[1]) if len(parts) > 1 and parts[1].strip() else np.nan
 
-            chrom, pos, raw_a1, raw_a2 = _parse_raw_alid(raw_alid)
+            chrom, pos, raw_a1, raw_a2 = parse_alid(raw_alid)
             alid_str, was_flipped = canonical_alid(chrom, pos, raw_a1, raw_a2)
             # Extract compressed alleles from the canonical ALID string
             _, allele_part = alid_str.split(":", 1)
@@ -224,6 +276,29 @@ def _load_variants(
     return np.array(rows, dtype=dt), np.array(eaf_list, dtype=np.float32)
 
 
+def _write_variants_tsv(
+    path: Path,
+    variants: np.ndarray,
+    eaf: np.ndarray,
+) -> None:
+    """Write ``variants.tsv`` — the per-variant metadata file inside .pleiodb.
+
+    Format (tab-separated, header row)::
+
+        alid    eaf
+        1:100_A_T   0.35
+        ...
+
+    Row order matches the V-axis of all binary matrices.  ``eaf`` values that
+    are NaN are written as empty strings.
+    """
+    with open(path, "w") as fh:
+        fh.write("alid\teaf\n")
+        for i in range(len(variants)):
+            alid = str(variants["id"][i])
+            e = float(eaf[i])
+            eaf_str = f"{e:.6g}" if np.isfinite(e) else ""
+            fh.write(f"{alid}\t{eaf_str}\n")
 
 
 def _build_pos_lookup(
@@ -268,21 +343,23 @@ def _make_regions_file(pos_lookup: dict[str, list]) -> str:
     return path
 
 
-def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
-    """Worker: read one VCF and return (local_t_idx, z, neff)."""
+def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    """Worker: read one VCF and return (local_t_idx, z, se, neff)."""
     local_t_idx, trait_id, vcf_path, pos_lookup, regions_file, n_variants = args
     log.info("  reading %-30s  %s", trait_id, vcf_path)
-    z, neff = read_vcf(vcf_path, pos_lookup, regions_file=regions_file)
+    z, se, neff = read_vcf(vcf_path, pos_lookup, regions_file=regions_file)
     # Pad / trim to exactly n_variants (pos_lookup may cover more rows than V
     # if the lifted lookup has extra entries from chr/bare duplication)
     z_out = np.full(n_variants, np.nan, dtype=np.float32)
+    se_out = np.full(n_variants, np.nan, dtype=np.float32)
     neff_out = np.full(n_variants, np.nan, dtype=np.float32)
     length = min(len(z), n_variants)
     z_out[:length] = z[:length]
+    se_out[:length] = se[:length]
     neff_out[:length] = neff[:length]
     n_hit = int(np.isfinite(z_out).sum())
     log.info("  done    %-30s  %d/%d variants matched", trait_id, n_hit, n_variants)
-    return local_t_idx, z_out, neff_out
+    return local_t_idx, z_out, se_out, neff_out
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +418,9 @@ def build_database(
             )
         return _lifted_cache[vcf_build_norm], _lifted_regions_cache[vcf_build_norm]
 
-    # ---- Write variant / trait metadata ------------------------------------
-    np.save(out / "variants.npy", variants)
+    # ---- Write variant metadata (TSV replaces variants.npy + eaf.f16) ------
+    _write_variants_tsv(out / "variants.tsv", variants, eaf)
+
     trait_dt = np.dtype([("id", "U64"), ("name", "U256")])
     trait_arr = np.array(
         [(t.trait_id, t.trait_name) for t in trait_pairs], dtype=trait_dt
@@ -357,6 +435,7 @@ def build_database(
 
     neff_sum = np.zeros(T, dtype=np.float64)
     neff_count = np.zeros(T, dtype=np.int64)
+    var_y_arr = np.full(T, np.nan, dtype=np.float64)   # accumulated per-trait var_y
 
     # ---- Main ingestion loop -----------------------------------------------
     for t_block_start in range(0, T, CT):
@@ -365,6 +444,7 @@ def build_database(
         B = len(batch_traits)
 
         z_block = np.full((V, B), np.nan, dtype=np.float32)
+        se_block = np.full((V, B), np.nan, dtype=np.float32)
         neff_block = np.full((V, B), np.nan, dtype=np.float32)
 
         args = [
@@ -375,11 +455,26 @@ def build_database(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
             for fut in as_completed(futures):
-                j, z, neff = fut.result()
+                j, z, se, neff = fut.result()
                 z_block[:, j] = z
+                se_block[:, j] = se
                 neff_block[:, j] = neff
                 n_done += 1
                 log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
+
+        # ---- var_y estimation (issue #10) -----------------------------------
+        for j, t in enumerate(batch_traits):
+            global_t = t_block_start + j
+            neff_study = compute_neff_study(t.N, t.K)
+            try:
+                vy, n_used = estimate_var_y(se_block[:, j], eaf, neff_study)
+                var_y_arr[global_t] = vy
+                log.info(
+                    "  var_y[%s] = %.4f  (from %d variants, Neff_study=%.0f)",
+                    t.trait_id, vy, n_used, neff_study,
+                )
+            except ValueError as exc:
+                log.warning("  var_y[%s] not estimated: %s", t.trait_id, exc)
 
         valid = np.isfinite(neff_block)
         neff_sum[t_block_start:t_block_end] += np.nansum(neff_block, axis=0)
@@ -403,9 +498,6 @@ def build_database(
     ).astype(np.float32)
     neff_base.tofile(out / "neff_base.f32")
 
-    # ---- EAF ---------------------------------------------------------------
-    encode_eaf(eaf).tofile(out / "eaf.f16")
-
     # ---- Significance masks ------------------------------------------------
     log.info("Building significance masks (%s)…", pval_thresholds)
     _build_masks(out, zscore_mat, V, T, pval_thresholds)
@@ -418,6 +510,11 @@ def build_database(
             pass
 
     # ---- Metadata ----------------------------------------------------------
+    # var_y: store as list; NaN → null so JSON round-trips cleanly
+    var_y_list = [
+        float(v) if np.isfinite(v) else None
+        for v in var_y_arr
+    ]
     meta = {
         "V": V,
         "T": T,
@@ -425,8 +522,9 @@ def build_database(
         "pval_thresholds": list(pval_thresholds),
         "z_scale": 100,
         "neff_encoding": "log2_u16_frac11",
-        "format_version": 2,
+        "format_version": 3,
         "variants_build": canon_build,
+        "var_y": var_y_list,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log.info("Build complete → %s", out)
