@@ -67,10 +67,10 @@ def read_vcf(
     vcf_path: str | Path,
     pos_lookup: dict[str, list[tuple[str, str, int]]],
     regions_file: str | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Parse a GWAS-VCF and return (z_scores, neff) float32 arrays aligned to the
-    variant list encoded in *pos_lookup*.
+    Parse a GWAS-VCF and return (z_scores, se, neff) float32 arrays aligned to
+    the variant list encoded in *pos_lookup*.
 
     Parameters
     ----------
@@ -86,16 +86,20 @@ def read_vcf(
 
     Returns
     -------
-    z_out, neff_out : float32 arrays, length = max(row_idx)+1 across all
-                      pos_lookup entries.  Missing entries remain NaN.
+    z_out   : float32(V) — z-scores (NaN = missing)
+    se_out  : float32(V) — per-variant SE from VCF FORMAT/SE field (NaN = missing)
+    neff_out: float32(V) — Neff from VCF SS/NS field (NaN = missing; deprecated,
+              will be replaced in a later version)
     """
     path = str(vcf_path)
     n = max((idx for entries in pos_lookup.values() for _, _, idx in entries),
             default=-1) + 1
     if n == 0:
-        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+        empty = np.array([], dtype=np.float32)
+        return empty, empty.copy(), empty.copy()
 
     z_out = np.full(n, _MISSING, dtype=np.float32)
+    se_out = np.full(n, _MISSING, dtype=np.float32)
     neff_out = np.full(n, _MISSING, dtype=np.float32)
 
     own_regions_file = False
@@ -152,6 +156,10 @@ def read_vcf(
                 if z is not None:
                     z_out[idx] = -z if flip else z
 
+                se = _extract_se(rec)
+                if se is not None:
+                    se_out[idx] = se   # SE is always positive; no flip needed
+
                 neff = _extract_neff(rec)
                 if neff is not None:
                     neff_out[idx] = neff
@@ -170,7 +178,7 @@ def read_vcf(
             except OSError:
                 pass
 
-    return z_out, neff_out
+    return z_out, se_out, neff_out
 
 
 def _extract_z(rec) -> float | None:
@@ -189,6 +197,19 @@ def _extract_z(rec) -> float | None:
             es_v, se_v = float(es[0][0]), float(se[0][0])
             if se_v > 0:
                 return es_v / se_v
+    except (TypeError, IndexError, ValueError):
+        pass
+    return None
+
+
+def _extract_se(rec) -> float | None:
+    """Return SE from FORMAT/SE field; None if absent or zero."""
+    try:
+        se = rec.format("SE")
+        if se is not None:
+            v = float(se[0][0])
+            if v > 0:
+                return v
     except (TypeError, IndexError, ValueError):
         pass
     return None
