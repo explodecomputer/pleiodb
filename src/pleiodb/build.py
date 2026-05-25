@@ -185,6 +185,41 @@ def compute_neff_study(N: int, K: float | None) -> float:
     return 4.0 * N * K * (1.0 - K)
 
 
+def derive_neff(
+    var_y: float,
+    se: np.ndarray,
+    eaf: np.ndarray,
+) -> np.ndarray:
+    """Compute per-variant effective sample size from var_y, SE, and EAF.
+
+    Formula::
+
+        Neff[v] = var_y / (SE[v]² × 2·EAF[v]·(1−EAF[v]))
+
+    This is the inverse of the SE formula under the normalised-beta model:
+    ``SE_norm = sqrt(var_y / (Neff × 2·EAF·(1−EAF)))``.
+
+    Parameters
+    ----------
+    var_y : float — phenotypic variance for the trait (from :func:`estimate_var_y`)
+    se    : float32 array, length V — per-variant SE from VCF FORMAT/SE field
+    eaf   : float32 array, length V — effect allele frequency (A2)
+
+    Returns
+    -------
+    float32 array, length V.  NaN when SE is NaN or EAF ∈ {0, 1}.
+    All finite values are positive.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denom = se.astype(np.float64) ** 2 * 2.0 * eaf.astype(np.float64) * (1.0 - eaf.astype(np.float64))
+        result = np.where(
+            np.isfinite(denom) & (denom > 0),
+            var_y / denom,
+            np.nan,
+        )
+    return result.astype(np.float32)
+
+
 def estimate_var_y(
     se: np.ndarray,
     eaf: np.ndarray,
@@ -343,23 +378,25 @@ def _make_regions_file(pos_lookup: dict[str, list]) -> str:
     return path
 
 
-def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
-    """Worker: read one VCF and return (local_t_idx, z, se, neff)."""
+def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
+    """Worker: read one VCF and return (local_t_idx, z, se).
+
+    Neff is **not** read from the VCF; it is derived from SE + var_y at
+    build time via :func:`derive_neff`.
+    """
     local_t_idx, trait_id, vcf_path, pos_lookup, regions_file, n_variants = args
     log.info("  reading %-30s  %s", trait_id, vcf_path)
-    z, se, neff = read_vcf(vcf_path, pos_lookup, regions_file=regions_file)
+    z, se = read_vcf(vcf_path, pos_lookup, regions_file=regions_file)
     # Pad / trim to exactly n_variants (pos_lookup may cover more rows than V
     # if the lifted lookup has extra entries from chr/bare duplication)
     z_out = np.full(n_variants, np.nan, dtype=np.float32)
     se_out = np.full(n_variants, np.nan, dtype=np.float32)
-    neff_out = np.full(n_variants, np.nan, dtype=np.float32)
     length = min(len(z), n_variants)
     z_out[:length] = z[:length]
     se_out[:length] = se[:length]
-    neff_out[:length] = neff[:length]
     n_hit = int(np.isfinite(z_out).sum())
     log.info("  done    %-30s  %d/%d variants matched", trait_id, n_hit, n_variants)
-    return local_t_idx, z_out, se_out, neff_out
+    return local_t_idx, z_out, se_out
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +470,8 @@ def build_database(
     zscore_mat.open_write()
     neff_mat.open_write()
 
-    neff_sum = np.zeros(T, dtype=np.float64)
-    neff_count = np.zeros(T, dtype=np.int64)
     var_y_arr = np.full(T, np.nan, dtype=np.float64)   # accumulated per-trait var_y
+    neff_base = np.full(T, np.nan, dtype=np.float32)   # per-trait median Neff (fallback)
 
     # ---- Main ingestion loop -----------------------------------------------
     for t_block_start in range(0, T, CT):
@@ -455,17 +491,24 @@ def build_database(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
             for fut in as_completed(futures):
-                j, z, se, neff = fut.result()
+                j, z, se = fut.result()
                 z_block[:, j] = z
                 se_block[:, j] = se
-                neff_block[:, j] = neff
                 n_done += 1
                 log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
-        # ---- var_y estimation (issue #10) -----------------------------------
+        # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
         for j, t in enumerate(batch_traits):
             global_t = t_block_start + j
             neff_study = compute_neff_study(t.N, t.K)
+
+            # Validate that the VCF contained usable SE values
+            if not np.any(np.isfinite(se_block[:, j])):
+                raise ValueError(
+                    f"Trait '{t.trait_id}': no valid SE values found in VCF at "
+                    f"{t.vcf_path}. ES and SE FORMAT fields are required."
+                )
+
             try:
                 vy, n_used = estimate_var_y(se_block[:, j], eaf, neff_study)
                 var_y_arr[global_t] = vy
@@ -473,12 +516,14 @@ def build_database(
                     "  var_y[%s] = %.4f  (from %d variants, Neff_study=%.0f)",
                     t.trait_id, vy, n_used, neff_study,
                 )
+                # Derive per-variant Neff from SE and var_y (issue #11)
+                neff_col = derive_neff(vy, se_block[:, j], eaf)
+                neff_block[:, j] = neff_col
+                finite_neff = neff_col[np.isfinite(neff_col)]
+                if len(finite_neff) > 0:
+                    neff_base[global_t] = float(np.median(finite_neff))
             except ValueError as exc:
-                log.warning("  var_y[%s] not estimated: %s", t.trait_id, exc)
-
-        valid = np.isfinite(neff_block)
-        neff_sum[t_block_start:t_block_end] += np.nansum(neff_block, axis=0)
-        neff_count[t_block_start:t_block_end] += valid.sum(axis=0)
+                log.warning("  var_y/Neff[%s] not estimated: %s", t.trait_id, exc)
 
         for v_block_start in range(0, V, CV):
             v_block_end = min(v_block_start + CV, V)
@@ -492,10 +537,7 @@ def build_database(
     zscore_mat.close_write()
     neff_mat.close_write()
 
-    # ---- Neff base ---------------------------------------------------------
-    neff_base = np.where(
-        neff_count > 0, neff_sum / neff_count, np.nan
-    ).astype(np.float32)
+    # ---- Neff base (median derived Neff per trait) -------------------------
     neff_base.tofile(out / "neff_base.f32")
 
     # ---- Significance masks ------------------------------------------------

@@ -67,9 +67,9 @@ def read_vcf(
     vcf_path: str | Path,
     pos_lookup: dict[str, list[tuple[str, str, int]]],
     regions_file: str | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Parse a GWAS-VCF and return (z_scores, se, neff) float32 arrays aligned to
+    Parse a GWAS-VCF and return (z_scores, se) float32 arrays aligned to
     the variant list encoded in *pos_lookup*.
 
     Parameters
@@ -86,21 +86,26 @@ def read_vcf(
 
     Returns
     -------
-    z_out   : float32(V) — z-scores (NaN = missing)
-    se_out  : float32(V) — per-variant SE from VCF FORMAT/SE field (NaN = missing)
-    neff_out: float32(V) — Neff from VCF SS/NS field (NaN = missing; deprecated,
-              will be replaced in a later version)
+    z_out  : float32(V) — z-scores (NaN = missing).
+             Computed from FORMAT/EZ if present, else from FORMAT/ES ÷ FORMAT/SE.
+    se_out : float32(V) — per-variant SE from VCF FORMAT/SE field (NaN = missing).
+             Always positive; no allele-flip sign change needed.
+
+    Notes
+    -----
+    The VCF ``SS``/``NS`` field (sample size) is **not** read.  Effective sample
+    size per variant is derived from SE and var_y at build time (see
+    :func:`pleiodb.build.derive_neff`).
     """
     path = str(vcf_path)
     n = max((idx for entries in pos_lookup.values() for _, _, idx in entries),
             default=-1) + 1
     if n == 0:
         empty = np.array([], dtype=np.float32)
-        return empty, empty.copy(), empty.copy()
+        return empty, empty.copy()
 
     z_out = np.full(n, _MISSING, dtype=np.float32)
     se_out = np.full(n, _MISSING, dtype=np.float32)
-    neff_out = np.full(n, _MISSING, dtype=np.float32)
 
     own_regions_file = False
     tmp_vcf: str | None = None
@@ -160,11 +165,8 @@ def read_vcf(
                 if se is not None:
                     se_out[idx] = se   # SE is always positive; no flip needed
 
-                neff = _extract_neff(rec)
-                if neff is not None:
-                    neff_out[idx] = neff
-
         vcf.close()
+        return z_out, se_out
 
     finally:
         if tmp_vcf and os.path.exists(tmp_vcf):
@@ -177,9 +179,6 @@ def read_vcf(
                 os.unlink(regions_file)
             except OSError:
                 pass
-
-    return z_out, se_out, neff_out
-
 
 def _extract_z(rec) -> float | None:
     try:
@@ -215,17 +214,3 @@ def _extract_se(rec) -> float | None:
     return None
 
 
-def _extract_neff(rec) -> float | None:
-    try:
-        ss = rec.format("SS")
-        if ss is not None:
-            return float(ss[0][0])
-    except (TypeError, ValueError):
-        pass
-    try:
-        ns = rec.INFO.get("NS")
-        if ns:
-            return float(ns)
-    except (TypeError, AttributeError, ValueError):
-        pass
-    return None
