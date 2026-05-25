@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from pleiodb.alid import compress_allele, is_compressed, canonical_alid, parse_alid
-from pleiodb.build import TraitInfo, load_trait_list
+from pleiodb.build import TraitInfo, load_trait_list, derive_neff
 from pleiodb.store import ChunkedMatrix
 from pleiodb.quantize import (
     encode_z, decode_z, encode_neff, decode_neff,
@@ -509,3 +509,68 @@ class TestEstimateVarY:
         se = np.full(5, 0.01, dtype=np.float32)
         _, n_used = estimate_var_y(se, eaf, 10_000)
         assert n_used == 4   # last one (EAF=0.005) excluded
+
+
+# ---------------------------------------------------------------------------
+# derive_neff (issue #11) — Neff from SE, not VCF SS
+# ---------------------------------------------------------------------------
+
+class TestDeriveNeff:
+    """Unit tests for derive_neff: Neff[v] = var_y / (SE[v]² × 2·EAF[v]·(1−EAF[v]))."""
+
+    def test_formula_correct(self):
+        """Spot-check the formula against hand-computed values."""
+        var_y = 1.0
+        se = np.array([0.01, 0.02], dtype=np.float32)
+        eaf = np.array([0.5, 0.3], dtype=np.float32)
+        result = derive_neff(var_y, se, eaf)
+        expected_0 = 1.0 / (0.01**2 * 2 * 0.5 * 0.5)   # = 10 000
+        expected_1 = 1.0 / (0.02**2 * 2 * 0.3 * 0.7)   # ≈ 5952
+        assert abs(float(result[0]) - expected_0) / expected_0 < 1e-4
+        assert abs(float(result[1]) - expected_1) / expected_1 < 1e-4
+
+    def test_nan_se_propagates_nan(self):
+        """NaN SE → NaN Neff; other entries are unaffected."""
+        se = np.array([np.nan, 0.01], dtype=np.float32)
+        eaf = np.array([0.5, 0.5], dtype=np.float32)
+        result = derive_neff(1.0, se, eaf)
+        assert np.isnan(result[0])
+        assert np.isfinite(result[1])
+
+    def test_zero_eaf_produces_nan(self):
+        """EAF = 0 → denominator = 0 → NaN (no divide-by-zero exception)."""
+        se = np.array([0.01], dtype=np.float32)
+        eaf = np.array([0.0], dtype=np.float32)
+        result = derive_neff(1.0, se, eaf)
+        assert np.isnan(result[0])
+
+    def test_one_eaf_produces_nan(self):
+        """EAF = 1 → denominator = 0 → NaN."""
+        se = np.array([0.01], dtype=np.float32)
+        eaf = np.array([1.0], dtype=np.float32)
+        result = derive_neff(1.0, se, eaf)
+        assert np.isnan(result[0])
+
+    def test_roundtrip_with_known_neff(self):
+        """SE derived from Neff → derive_neff must recover that Neff."""
+        var_y = 1.5
+        neff_true = 50_000.0
+        eaf = np.array([0.2, 0.4, 0.6], dtype=np.float32)
+        se = np.sqrt(var_y / (2.0 * eaf * (1.0 - eaf) * neff_true)).astype(np.float32)
+        result = derive_neff(var_y, se, eaf)
+        for v in result:
+            assert abs(float(v) - neff_true) / neff_true < 1e-3
+
+    def test_output_dtype_float32(self):
+        """Return array must be float32."""
+        se = np.array([0.01], dtype=np.float32)
+        eaf = np.array([0.5], dtype=np.float32)
+        result = derive_neff(1.0, se, eaf)
+        assert result.dtype == np.float32
+
+    def test_all_finite_values_positive(self):
+        """All finite Neff values must be positive."""
+        se = np.full(50, 0.01, dtype=np.float32)
+        eaf = np.linspace(0.05, 0.95, 50).astype(np.float32)
+        result = derive_neff(1.0, se, eaf)
+        assert np.all(result[np.isfinite(result)] > 0)

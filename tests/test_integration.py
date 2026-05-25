@@ -281,3 +281,58 @@ class TestVarYIngest:
         assert var_y_cad is not None and np.isfinite(var_y_cad) and var_y_cad > 0, (
             f"ieu-a-7 var_y={var_y_cad} not positive-finite"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — Neff derived from SE (issue #11)
+# ---------------------------------------------------------------------------
+
+class TestNeffDerivedFromSE:
+    """Neff stored in the DB is derived from SE + var_y, not from VCF SS."""
+
+    def test_build_completes(self, tmp_path):
+        """Build must succeed with the new Neff derivation path."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        assert db.T == 5
+
+    def test_neff_matrix_has_finite_values(self, tmp_path):
+        """After build, the Neff matrix must contain finite values for the spot trait."""
+        from pleiodb.quantize import decode_neff
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        t_idx = int(db.trait_index([SPOT_TRAIT])[0])
+        neff_raw = db._neff.get_block(0, db.V, t_idx, t_idx + 1)[:, 0]
+        neff = decode_neff(neff_raw)
+        n_finite = int(np.isfinite(neff).sum())
+        assert n_finite > 0, "Expected finite Neff values in the neff matrix"
+
+    def test_neff_consistent_with_reconstruction(self, tmp_path):
+        """SE_norm = 1/sqrt(Neff × 2·EAF·(1−EAF)) must match SE_vcf/sqrt(var_y)."""
+        import json
+        from pleiodb.quantize import decode_neff
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+
+        v_idx = int(db.variant_index([SPOT_ALID])[0])
+        t_idx = int(db.trait_index([SPOT_TRAIT])[0])
+
+        neff_raw = db._neff.get_block(v_idx, v_idx + 1, t_idx, t_idx + 1)[0, 0]
+        neff = float(decode_neff(np.array([neff_raw]))[0])
+        eaf_v = float(db.eaf[v_idx])
+
+        assert np.isfinite(neff) and neff > 0, f"Neff for spot variant is {neff}"
+
+        # SE_norm from stored Neff
+        se_norm_from_neff = 1.0 / np.sqrt(neff * 2.0 * eaf_v * (1.0 - eaf_v))
+
+        # Expected SE_norm = SE_vcf / sqrt(var_y)
+        meta = json.loads((db_path / "meta.json").read_text())
+        var_y = meta["var_y"][t_idx]
+        se_vcf = 0.017765   # known from SPOT_ALID / SPOT_TRAIT VCF record
+        se_norm_expected = se_vcf / np.sqrt(var_y)
+
+        assert abs(se_norm_from_neff - se_norm_expected) / se_norm_expected < 0.05, (
+            f"SE_norm from Neff = {se_norm_from_neff:.5f}, "
+            f"expected SE_vcf/sqrt(var_y) ≈ {se_norm_expected:.5f}  (5% tolerance)"
+        )
