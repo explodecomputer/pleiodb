@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source ~/.initMamba.sh && mamba run -n pleiodb python -m pytest tests/test_integration.py -v 2>&1)",
+      "Bash(source ~/.initMamba.sh 2>/dev/null; mamba run -n pleiodb python -m pytest tests/ -v --tb=short 2>&1)"
+    ]
+  }
+}
