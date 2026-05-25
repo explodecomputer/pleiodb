@@ -13,6 +13,8 @@ Test data lives in tests/test_data/:
 
 from __future__ import annotations
 
+import csv
+import io
 import subprocess
 from pathlib import Path
 
@@ -423,3 +425,77 @@ class TestTraitsTsv:
                 assert abs(float(tsv_vy_str) - meta_vy) < 1e-4, (
                     f"var_y mismatch at trait {i}: tsv={tsv_vy_str}, meta={meta_vy}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — Query output: z, beta_norm, se_norm, pval always returned (#14)
+# ---------------------------------------------------------------------------
+
+def _query_variant_rows(db_path, variant_id):
+    """Helper: query a single variant and return parsed rows as list[dict]."""
+    from pleiodb.cli import _query_single_variant
+    db = _open(db_path)
+    fh = io.StringIO()
+    _query_single_variant(db, variant_id, None, "tsv", fh)
+    fh.seek(0)
+    return list(csv.DictReader(fh, delimiter="\t"))
+
+
+class TestQueryOutput:
+    """Query always returns variant_id, trait_id, z, beta_norm, se_norm, pval."""
+
+    def test_header_has_required_columns(self, tmp_path):
+        """Every query path must produce a header with the six required columns."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert header == ["variant_id", "trait_id", "z", "beta_norm", "se_norm", "pval"], (
+            f"Unexpected header: {header}"
+        )
+
+    def test_pval_formula(self, tmp_path):
+        """pval must equal 2·Φ(−|Z|) for the spot variant."""
+        from scipy.stats import norm
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None, f"{SPOT_TRAIT} not found in query output"
+        z_val = float(spot["z"])
+        pval_val = float(spot["pval"])
+        expected = 2 * norm.sf(abs(z_val))
+        assert abs(pval_val - expected) / max(expected, 1e-300) < 1e-3
+
+    def test_beta_norm_se_norm_finite_positive_se(self, tmp_path):
+        """beta_norm is finite and se_norm is positive for the spot variant."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None
+        beta = float(spot["beta_norm"])
+        se = float(spot["se_norm"])
+        assert np.isfinite(beta), f"beta_norm={beta} is not finite"
+        assert se > 0, f"se_norm={se} is not positive"
+
+    def test_beta_norm_equals_z_times_se_norm(self, tmp_path):
+        """beta_norm = Z × se_norm (definition of normalised beta)."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None
+        z = float(spot["z"])
+        beta = float(spot["beta_norm"])
+        se = float(spot["se_norm"])
+        assert abs(beta - z * se) / max(abs(beta), 1e-10) < 1e-3
+
+    def test_cli_no_beta_se_flag(self):
+        """The query command must NOT have a --beta-se option (always on)."""
+        import click.testing
+        from pleiodb.cli import main
+        runner = click.testing.CliRunner()
+        result = runner.invoke(main, ["query", "--help"])
+        assert "--beta-se" not in result.output, \
+            "--beta-se flag should have been removed (output is always full)"
