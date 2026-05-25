@@ -83,19 +83,21 @@ def _load_variants_tsv(
 
 def _load_traits_tsv(
     path: "Path",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Parse ``traits.tsv`` → (traits structured array, neff_study float32 array).
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Parse ``traits.tsv`` → (traits structured array, neff_study, var_y).
 
-    Shared by the ``traits`` and ``neff_base`` properties; both are populated in
-    a single pass so the file is only read once.
+    Shared by the ``traits``, ``neff_base``, and ``var_y`` properties; all
+    three are populated in a single pass so the file is only read once.
 
     Returns
     -------
     traits      : structured array with fields id(U64), name(U256)
     neff_study  : float32(T) — study-level Neff per trait (used as Neff fallback)
+    var_y       : float32(T) — per-trait phenotypic variance (NaN if unknown)
     """
     rows: list[tuple[str, str]] = []
     neff_list: list[float] = []
+    var_y_list: list[float] = []
     with open(path) as fh:
         header: list[str] | None = None
         for line in fh:
@@ -109,10 +111,13 @@ def _load_traits_tsv(
             rows.append((cells.get("trait_id", ""), cells.get("trait_name", "")))
             raw_neff = cells.get("neff_study", "").strip()
             neff_list.append(float(raw_neff) if raw_neff else np.nan)
+            raw_vy = cells.get("var_y", "").strip()
+            var_y_list.append(float(raw_vy) if raw_vy else np.nan)
 
     traits = np.array(rows, dtype=_TRAITS_DT)
     neff_study = np.array(neff_list, dtype=np.float32)
-    return traits, neff_study
+    var_y = np.array(var_y_list, dtype=np.float32)
+    return traits, neff_study, var_y
 
 
 class GWASDatabase:
@@ -122,6 +127,7 @@ class GWASDatabase:
         self._variants: np.ndarray | None = None
         self._traits: np.ndarray | None = None
         self._neff_base_arr: np.ndarray | None = None   # loaded together with _traits
+        self._var_y_arr: np.ndarray | None = None        # loaded together with _traits
         self._zscore: ChunkedMatrix | None = None
         self._neff: ChunkedMatrix | None = None
         self._eaf: np.ndarray | None = None
@@ -178,9 +184,9 @@ class GWASDatabase:
         return self._variants
 
     def _ensure_traits_loaded(self) -> None:
-        """Load traits.tsv once, populating both _traits and _neff_base_arr caches."""
+        """Load traits.tsv once, populating _traits, _neff_base_arr, _var_y_arr."""
         if self._traits is None:
-            self._traits, self._neff_base_arr = _load_traits_tsv(
+            self._traits, self._neff_base_arr, self._var_y_arr = _load_traits_tsv(
                 self.path / "traits.tsv"
             )
 
@@ -198,6 +204,12 @@ class GWASDatabase:
     def neff_base(self) -> np.ndarray:
         self._ensure_traits_loaded()
         return self._neff_base_arr
+
+    @property
+    def var_y(self) -> np.ndarray:
+        """Per-trait phenotypic variance from traits.tsv (float32, NaN if unknown)."""
+        self._ensure_traits_loaded()
+        return self._var_y_arr
 
     @property
     def lambda_matrix(self) -> ChunkedMatrix:

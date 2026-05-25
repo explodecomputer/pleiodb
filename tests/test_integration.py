@@ -499,3 +499,94 @@ class TestQueryOutput:
         result = runner.invoke(main, ["query", "--help"])
         assert "--beta-se" not in result.output, \
             "--beta-se flag should have been removed (output is always full)"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — Study-scale beta via --study-scale flag (issue #15)
+# ---------------------------------------------------------------------------
+
+def _query_variant_rows_study(db_path, variant_id):
+    """Helper: query a single variant with --study-scale and return rows."""
+    from pleiodb.cli import _query_single_variant
+    db = _open(db_path)
+    fh = io.StringIO()
+    _query_single_variant(db, variant_id, None, "tsv", fh, study_scale=True)
+    fh.seek(0)
+    return list(csv.DictReader(fh, delimiter="\t"))
+
+
+class TestStudyScaleBeta:
+    """--study-scale adds beta_study and se_study = sqrt(var_y) * normalised values."""
+
+    def test_study_scale_header_has_extra_columns(self, tmp_path):
+        """With study_scale=True, output header includes beta_study and se_study."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh, study_scale=True)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert "beta_study" in header, f"beta_study missing from header: {header}"
+        assert "se_study" in header, f"se_study missing from header: {header}"
+
+    def test_without_flag_no_extra_columns(self, tmp_path):
+        """Without study_scale, beta_study and se_study must not appear."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert "beta_study" not in header
+        assert "se_study" not in header
+
+    def test_beta_study_equals_sqrt_var_y_times_beta_norm(self, tmp_path):
+        """beta_study = sqrt(var_y[t]) × beta_norm within floating-point tolerance."""
+        import json
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta = json.loads((db_path / "meta.json").read_text())
+
+        norm_rows = _query_variant_rows(db_path, SPOT_ALID)
+        study_rows = _query_variant_rows_study(db_path, SPOT_ALID)
+
+        spot_norm = next((r for r in norm_rows if r["trait_id"] == SPOT_TRAIT), None)
+        spot_study = next((r for r in study_rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot_norm is not None and spot_study is not None
+
+        t_idx = 1  # ieu-a-7 is index 1 in traits.tsv
+        var_y = meta["var_y"][t_idx]
+        beta_norm = float(spot_norm["beta_norm"])
+        beta_study = float(spot_study["beta_study"])
+        expected = np.sqrt(var_y) * beta_norm
+        assert abs(beta_study - expected) / max(abs(expected), 1e-10) < 1e-4
+
+    def test_se_study_equals_sqrt_var_y_times_se_norm(self, tmp_path):
+        """se_study = sqrt(var_y[t]) × se_norm."""
+        import json
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta = json.loads((db_path / "meta.json").read_text())
+
+        norm_rows = _query_variant_rows(db_path, SPOT_ALID)
+        study_rows = _query_variant_rows_study(db_path, SPOT_ALID)
+
+        spot_norm = next((r for r in norm_rows if r["trait_id"] == SPOT_TRAIT), None)
+        spot_study = next((r for r in study_rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot_norm is not None and spot_study is not None
+
+        t_idx = 1
+        var_y = meta["var_y"][t_idx]
+        se_norm = float(spot_norm["se_norm"])
+        se_study = float(spot_study["se_study"])
+        expected = np.sqrt(var_y) * se_norm
+        assert abs(se_study - expected) / max(expected, 1e-10) < 1e-4
+
+    def test_cli_study_scale_flag_exists(self):
+        """The query command must have a --study-scale option."""
+        import click.testing
+        from pleiodb.cli import main
+        runner = click.testing.CliRunner()
+        result = runner.invoke(main, ["query", "--help"])
+        assert "--study-scale" in result.output, \
+            "--study-scale flag missing from CLI help"
