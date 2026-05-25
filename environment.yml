@@ -12,4 +12,6 @@ dependencies:
   - pip
   - pip:
     - pyliftover>=0.4       # coordinate liftover (pure Python, pip is fine)
+    - matplotlib>=3.7       # validation notebook plots
+    - ipykernel>=6          # register env as a Jupyter kernel
     - -e ".[dev]"           # install pleiodb + dev extras (pytest etc.)
