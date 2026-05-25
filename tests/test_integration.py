@@ -13,6 +13,8 @@ Test data lives in tests/test_data/:
 
 from __future__ import annotations
 
+import csv
+import io
 import subprocess
 from pathlib import Path
 
@@ -336,3 +338,255 @@ class TestNeffDerivedFromSE:
             f"SE_norm from Neff = {se_norm_from_neff:.5f}, "
             f"expected SE_vcf/sqrt(var_y) ≈ {se_norm_expected:.5f}  (5% tolerance)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — traits.tsv storage format (issue #12)
+# ---------------------------------------------------------------------------
+
+class TestTraitsTsv:
+    """Verify that build_database writes traits.tsv and not traits.npy / neff_base.f32."""
+
+    def test_traits_tsv_written(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        assert (db_path / "traits.tsv").exists(), "traits.tsv should be written"
+
+    def test_legacy_files_absent(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        assert not (db_path / "traits.npy").exists(), "traits.npy should not be written"
+        assert not (db_path / "neff_base.f32").exists(), "neff_base.f32 should not be written"
+
+    def test_traits_tsv_header(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        with open(db_path / "traits.tsv") as f:
+            header = f.readline().strip().split("\t")
+        required = {"trait_id", "trait_name", "N", "K", "neff_study", "var_y",
+                    "n_variants", "n_variants_var_y"}
+        assert required.issubset(set(header)), (
+            f"Missing columns: {required - set(header)}"
+        )
+
+    def test_traits_tsv_row_count(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        lines = (db_path / "traits.tsv").read_text().strip().splitlines()
+        assert len(lines) == 6, f"expected 6 (5 traits + 1 header), got {len(lines)}"
+
+    def test_db_traits_reads_correctly(self, tmp_path):
+        """GWASDatabase.traits must return a structured array with id and name fields."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        t = db.traits
+        assert len(t) == 5
+        assert "id" in t.dtype.names
+        assert "name" in t.dtype.names
+
+    def test_trait_index_works(self, tmp_path):
+        """trait_index must correctly resolve SPOT_TRAIT from traits.tsv."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        idx = db.trait_index([SPOT_TRAIT])
+        assert len(idx) == 1 and 0 <= idx[0] < 5
+
+    def test_neff_base_from_traits_tsv(self, tmp_path):
+        """db.neff_base must return a float32 array of length T read from traits.tsv."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        nb = db.neff_base
+        assert len(nb) == 5
+        assert nb.dtype == np.float32
+        assert np.all(np.isfinite(nb) & (nb > 0)), \
+            f"neff_base has non-positive or non-finite entries: {nb}"
+
+    def test_n_variants_column_populated(self, tmp_path):
+        """n_variants column must be positive integers for all traits."""
+        import csv
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        with open(db_path / "traits.tsv") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                n_v = int(row["n_variants"])
+                assert n_v > 0, f"n_variants=0 for trait {row['trait_id']}"
+
+    def test_var_y_column_matches_meta(self, tmp_path):
+        """var_y in traits.tsv must match the values in meta.json."""
+        import json
+        import csv
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta_var_y = json.loads((db_path / "meta.json").read_text())["var_y"]
+        with open(db_path / "traits.tsv") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            rows = list(reader)
+        for i, row in enumerate(rows):
+            tsv_vy_str = row["var_y"]
+            meta_vy = meta_var_y[i]
+            if meta_vy is None:
+                assert tsv_vy_str == "", f"Expected empty var_y for trait {i}"
+            else:
+                assert abs(float(tsv_vy_str) - meta_vy) < 1e-4, (
+                    f"var_y mismatch at trait {i}: tsv={tsv_vy_str}, meta={meta_vy}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — Query output: z, beta_norm, se_norm, pval always returned (#14)
+# ---------------------------------------------------------------------------
+
+def _query_variant_rows(db_path, variant_id):
+    """Helper: query a single variant and return parsed rows as list[dict]."""
+    from pleiodb.cli import _query_single_variant
+    db = _open(db_path)
+    fh = io.StringIO()
+    _query_single_variant(db, variant_id, None, "tsv", fh)
+    fh.seek(0)
+    return list(csv.DictReader(fh, delimiter="\t"))
+
+
+class TestQueryOutput:
+    """Query always returns variant_id, trait_id, z, beta_norm, se_norm, pval."""
+
+    def test_header_has_required_columns(self, tmp_path):
+        """Every query path must produce a header with the six required columns."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert header == ["variant_id", "trait_id", "z", "beta_norm", "se_norm", "pval"], (
+            f"Unexpected header: {header}"
+        )
+
+    def test_pval_formula(self, tmp_path):
+        """pval must equal 2·Φ(−|Z|) for the spot variant."""
+        from scipy.stats import norm
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None, f"{SPOT_TRAIT} not found in query output"
+        z_val = float(spot["z"])
+        pval_val = float(spot["pval"])
+        expected = 2 * norm.sf(abs(z_val))
+        assert abs(pval_val - expected) / max(expected, 1e-300) < 1e-3
+
+    def test_beta_norm_se_norm_finite_positive_se(self, tmp_path):
+        """beta_norm is finite and se_norm is positive for the spot variant."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None
+        beta = float(spot["beta_norm"])
+        se = float(spot["se_norm"])
+        assert np.isfinite(beta), f"beta_norm={beta} is not finite"
+        assert se > 0, f"se_norm={se} is not positive"
+
+    def test_beta_norm_equals_z_times_se_norm(self, tmp_path):
+        """beta_norm = Z × se_norm (definition of normalised beta)."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_variant_rows(db_path, SPOT_ALID)
+        spot = next((r for r in rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot is not None
+        z = float(spot["z"])
+        beta = float(spot["beta_norm"])
+        se = float(spot["se_norm"])
+        assert abs(beta - z * se) / max(abs(beta), 1e-10) < 1e-3
+
+    def test_cli_no_beta_se_flag(self):
+        """The query command must NOT have a --beta-se option (always on)."""
+        import click.testing
+        from pleiodb.cli import main
+        runner = click.testing.CliRunner()
+        result = runner.invoke(main, ["query", "--help"])
+        assert "--beta-se" not in result.output, \
+            "--beta-se flag should have been removed (output is always full)"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — Study-scale beta via --study-scale flag (issue #15)
+# ---------------------------------------------------------------------------
+
+def _query_variant_rows_study(db_path, variant_id):
+    """Helper: query a single variant with --study-scale and return rows."""
+    from pleiodb.cli import _query_single_variant
+    db = _open(db_path)
+    fh = io.StringIO()
+    _query_single_variant(db, variant_id, None, "tsv", fh, study_scale=True)
+    fh.seek(0)
+    return list(csv.DictReader(fh, delimiter="\t"))
+
+
+class TestStudyScaleBeta:
+    """--study-scale adds beta_study and se_study = sqrt(var_y) * normalised values."""
+
+    def test_study_scale_header_has_extra_columns(self, tmp_path):
+        """With study_scale=True, output header includes beta_study and se_study."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh, study_scale=True)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert "beta_study" in header, f"beta_study missing from header: {header}"
+        assert "se_study" in header, f"se_study missing from header: {header}"
+
+    def test_without_flag_no_extra_columns(self, tmp_path):
+        """Without study_scale, beta_study and se_study must not appear."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert "beta_study" not in header
+        assert "se_study" not in header
+
+    def test_beta_study_equals_sqrt_var_y_times_beta_norm(self, tmp_path):
+        """beta_study = sqrt(var_y[t]) × beta_norm within floating-point tolerance."""
+        import json
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta = json.loads((db_path / "meta.json").read_text())
+
+        norm_rows = _query_variant_rows(db_path, SPOT_ALID)
+        study_rows = _query_variant_rows_study(db_path, SPOT_ALID)
+
+        spot_norm = next((r for r in norm_rows if r["trait_id"] == SPOT_TRAIT), None)
+        spot_study = next((r for r in study_rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot_norm is not None and spot_study is not None
+
+        t_idx = 1  # ieu-a-7 is index 1 in traits.tsv
+        var_y = meta["var_y"][t_idx]
+        beta_norm = float(spot_norm["beta_norm"])
+        beta_study = float(spot_study["beta_study"])
+        expected = np.sqrt(var_y) * beta_norm
+        assert abs(beta_study - expected) / max(abs(expected), 1e-10) < 1e-4
+
+    def test_se_study_equals_sqrt_var_y_times_se_norm(self, tmp_path):
+        """se_study = sqrt(var_y[t]) × se_norm."""
+        import json
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta = json.loads((db_path / "meta.json").read_text())
+
+        norm_rows = _query_variant_rows(db_path, SPOT_ALID)
+        study_rows = _query_variant_rows_study(db_path, SPOT_ALID)
+
+        spot_norm = next((r for r in norm_rows if r["trait_id"] == SPOT_TRAIT), None)
+        spot_study = next((r for r in study_rows if r["trait_id"] == SPOT_TRAIT), None)
+        assert spot_norm is not None and spot_study is not None
+
+        t_idx = 1
+        var_y = meta["var_y"][t_idx]
+        se_norm = float(spot_norm["se_norm"])
+        se_study = float(spot_study["se_study"])
+        expected = np.sqrt(var_y) * se_norm
+        assert abs(se_study - expected) / max(expected, 1e-10) < 1e-4
+
+    def test_cli_study_scale_flag_exists(self):
+        """The query command must have a --study-scale option."""
+        import click.testing
+        from pleiodb.cli import main
+        runner = click.testing.CliRunner()
+        result = runner.invoke(main, ["query", "--help"])
+        assert "--study-scale" in result.output, \
+            "--study-scale flag missing from CLI help"

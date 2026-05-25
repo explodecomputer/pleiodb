@@ -5,13 +5,14 @@ Directory layout:
   {name}.pleiodb/
     meta.json          — dimensions, chunk sizes, dtypes, thresholds, var_y per trait
     variants.tsv       — V rows + header: alid, eaf  (replaces variants.npy + eaf.f16)
-    traits.npy         — structured array: id(U64), name(U256)
+    traits.tsv         — T rows + header: trait_id, trait_name, N, K, neff_study,
+                         var_y, n_variants, n_variants_var_y, n_sig_*
+                         (replaces traits.npy + neff_base.f32)
     zscore.bin/.cidx   — V×T  int16  (z * 100, NA = -32768)
     neff.bin/.cidx     — V×T  uint16 (log2-encoded, NA = 0xFFFF)
     lambda.bin/.cidx   — T×T  float16 (symmetric)
     masks/
       {thr}.coo.zst    — COO-format significance hits: sorted (v_idx u4, t_idx u4) pairs
-    neff_base.f32      — T    float32  per-trait median Neff (used as fallback)
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from .quantize import (
 
 _DCTX = zstd.ZstdDecompressor()
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
+
+_TRAITS_DT = np.dtype([("id", "U64"), ("name", "U256")])
 
 _VARIANTS_DT = np.dtype([
     ("id",    "U64"),
@@ -78,17 +81,57 @@ def _load_variants_tsv(
     return variants, eaf
 
 
+def _load_traits_tsv(
+    path: "Path",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Parse ``traits.tsv`` → (traits structured array, neff_study, var_y).
+
+    Shared by the ``traits``, ``neff_base``, and ``var_y`` properties; all
+    three are populated in a single pass so the file is only read once.
+
+    Returns
+    -------
+    traits      : structured array with fields id(U64), name(U256)
+    neff_study  : float32(T) — study-level Neff per trait (used as Neff fallback)
+    var_y       : float32(T) — per-trait phenotypic variance (NaN if unknown)
+    """
+    rows: list[tuple[str, str]] = []
+    neff_list: list[float] = []
+    var_y_list: list[float] = []
+    with open(path) as fh:
+        header: list[str] | None = None
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if header is None:
+                header = line.split("\t")
+                continue
+            cells = dict(zip(header, line.split("\t")))
+            rows.append((cells.get("trait_id", ""), cells.get("trait_name", "")))
+            raw_neff = cells.get("neff_study", "").strip()
+            neff_list.append(float(raw_neff) if raw_neff else np.nan)
+            raw_vy = cells.get("var_y", "").strip()
+            var_y_list.append(float(raw_vy) if raw_vy else np.nan)
+
+    traits = np.array(rows, dtype=_TRAITS_DT)
+    neff_study = np.array(neff_list, dtype=np.float32)
+    var_y = np.array(var_y_list, dtype=np.float32)
+    return traits, neff_study, var_y
+
+
 class GWASDatabase:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._meta: dict = {}
         self._variants: np.ndarray | None = None
         self._traits: np.ndarray | None = None
+        self._neff_base_arr: np.ndarray | None = None   # loaded together with _traits
+        self._var_y_arr: np.ndarray | None = None        # loaded together with _traits
         self._zscore: ChunkedMatrix | None = None
         self._neff: ChunkedMatrix | None = None
         self._eaf: np.ndarray | None = None
         self._lambda: ChunkedMatrix | None = None
-        self._neff_base: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Open / close
@@ -140,10 +183,16 @@ class GWASDatabase:
         self._ensure_variants_loaded()
         return self._variants
 
+    def _ensure_traits_loaded(self) -> None:
+        """Load traits.tsv once, populating _traits, _neff_base_arr, _var_y_arr."""
+        if self._traits is None:
+            self._traits, self._neff_base_arr, self._var_y_arr = _load_traits_tsv(
+                self.path / "traits.tsv"
+            )
+
     @property
     def traits(self) -> np.ndarray:
-        if self._traits is None:
-            self._traits = np.load(self.path / "traits.npy", allow_pickle=False)
+        self._ensure_traits_loaded()
         return self._traits
 
     @property
@@ -153,13 +202,14 @@ class GWASDatabase:
 
     @property
     def neff_base(self) -> np.ndarray:
-        if self._neff_base is None:
-            p = self.path / "neff_base.f32"
-            if p.exists():
-                self._neff_base = np.fromfile(p, dtype=np.float32)
-            else:
-                self._neff_base = np.full(self.T, np.nan, dtype=np.float32)
-        return self._neff_base
+        self._ensure_traits_loaded()
+        return self._neff_base_arr
+
+    @property
+    def var_y(self) -> np.ndarray:
+        """Per-trait phenotypic variance from traits.tsv (float32, NaN if unknown)."""
+        self._ensure_traits_loaded()
+        return self._var_y_arr
 
     @property
     def lambda_matrix(self) -> ChunkedMatrix:

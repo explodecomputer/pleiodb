@@ -134,31 +134,42 @@ def compute_lambda(db_path, workers, null_thresh):
               help="Output file (default: stdout)")
 @click.option("--format", "fmt", default="tsv",
               type=click.Choice(["tsv", "json"]), show_default=True)
-@click.option("--beta-se", is_flag=True, default=False,
-              help="Include reconstructed beta and SE columns")
-def query(db_path, variant, trait, region, variants_file, traits_file, pval, output, fmt, beta_se):
-    """Query z-scores (and optionally beta/SE) from the database."""
+@click.option("--study-scale", is_flag=True, default=False,
+              help="Add beta_study and se_study columns (original phenotype scale). "
+                   "beta_study = sqrt(var_y) × beta_norm.  For binary traits, "
+                   "this recovers the log-OR scale.")
+def query(db_path, variant, trait, region, variants_file, traits_file, pval, output,
+          fmt, study_scale):
+    """Query z-scores, normalised beta/SE, and p-values from the database.
+
+    Every row in the output contains: variant_id, trait_id, z, beta_norm,
+    se_norm, pval.  beta_norm and se_norm are on the var(y)=1 scale;
+    pval = 2·Φ(−|Z|) (two-sided).
+
+    With --study-scale, two additional columns beta_study and se_study are
+    appended, scaled by sqrt(var_y[t]) to recover original phenotype units.
+    """
     db = _open_db(db_path)
     fh = open(output, "w") if output else sys.stdout
 
     try:
         if pval is not None and variant is None and trait is None and region is None \
                 and variants_file is None and traits_file is None:
-            _query_pval(db, pval, fmt, fh, beta_se)
+            _query_pval(db, pval, fmt, fh, study_scale=study_scale)
 
         elif variant is not None:
-            _query_single_variant(db, variant, pval, fmt, fh, beta_se)
+            _query_single_variant(db, variant, pval, fmt, fh, study_scale=study_scale)
 
         elif trait is not None:
-            _query_single_trait(db, trait, pval, fmt, fh, beta_se)
+            _query_single_trait(db, trait, pval, fmt, fh, study_scale=study_scale)
 
         elif region is not None:
-            _query_region(db, region, pval, fmt, fh, beta_se)
+            _query_region(db, region, pval, fmt, fh, study_scale=study_scale)
 
         elif variants_file or traits_file:
             v_ids = _read_id_file(variants_file) if variants_file else None
             t_ids = _read_id_file(traits_file) if traits_file else None
-            _query_block(db, v_ids, t_ids, pval, fmt, fh, beta_se)
+            _query_block(db, v_ids, t_ids, pval, fmt, fh, study_scale=study_scale)
 
         else:
             raise click.UsageError(
@@ -183,122 +194,141 @@ def _trait_label(db, t_idx: int) -> str:
     return str(db.traits["id"][t_idx])
 
 
-def _header(extra: bool) -> list[str]:
-    h = ["variant_id", "trait_id", "z"]
-    if extra:
-        h += ["beta", "se"]
-    return h
+_QUERY_HEADER = ["variant_id", "trait_id", "z", "beta_norm", "se_norm", "pval"]
+_STUDY_EXTRA = ["beta_study", "se_study"]
 
 
-def _query_single_variant(db, vid, pval, fmt, fh, beta_se):
-    v_idx_arr = db.variant_index([vid])
-    v_idx = int(v_idx_arr[0])
+def _compute_pval(z_val: float) -> float:
+    """Two-sided p-value: 2·Φ(−|Z|)."""
+    from scipy.stats import norm
+    return float(2 * norm.sf(abs(z_val)))
+
+
+def _header(study_scale: bool) -> list[str]:
+    return _QUERY_HEADER + (_STUDY_EXTRA if study_scale else [])
+
+
+def _make_row(vid, tid, z_val, beta_val, se_val,
+              study_scale: bool = False, var_y_t: float = np.nan) -> list:
+    row = [
+        vid, tid,
+        round(z_val, 4),
+        round(beta_val, 6),
+        round(se_val, 6),
+        _compute_pval(z_val),
+    ]
+    if study_scale:
+        sqrt_vy = float(np.sqrt(var_y_t)) if np.isfinite(var_y_t) else np.nan
+        row += [
+            round(sqrt_vy * beta_val, 6) if np.isfinite(sqrt_vy) else float("nan"),
+            round(sqrt_vy * se_val, 6)   if np.isfinite(sqrt_vy) else float("nan"),
+        ]
+    return row
+
+
+def _query_single_variant(db, vid, pval, fmt, fh, study_scale: bool = False):
+    v_idx = int(db.variant_index([vid])[0])
     z = db.zscore_variant(v_idx)
-    header = _header(beta_se)
-    if beta_se:
-        beta_arr, se_arr = db.beta_se_variant(v_idx)
-
+    beta_arr, se_arr = db.beta_se_variant(v_idx)
+    var_y = db.var_y if study_scale else None
     rows = []
     for t_idx in range(db.T):
         z_val = float(z[t_idx])
         if np.isnan(z_val):
             continue
-        if pval is not None:
-            from scipy.stats import norm
-            p = 2 * norm.sf(abs(z_val))
-            if p > pval:
-                continue
-        row = [vid, _trait_label(db, t_idx), round(z_val, 4)]
-        if beta_se:
-            row += [round(float(beta_arr[t_idx]), 6), round(float(se_arr[t_idx]), 6)]
-        rows.append(row)
-    _print_table(header, rows, fmt, fh)
+        if pval is not None and _compute_pval(z_val) > pval:
+            continue
+        vy = float(var_y[t_idx]) if study_scale else np.nan
+        rows.append(_make_row(
+            vid, _trait_label(db, t_idx), z_val,
+            float(beta_arr[t_idx]), float(se_arr[t_idx]),
+            study_scale=study_scale, var_y_t=vy,
+        ))
+    _print_table(_header(study_scale), rows, fmt, fh)
 
 
-def _query_single_trait(db, tid, pval, fmt, fh, beta_se):
+def _query_single_trait(db, tid, pval, fmt, fh, study_scale: bool = False):
     t_idx = int(db.trait_index([tid])[0])
     z = db.zscore_trait(t_idx)
-    header = _header(beta_se)
-
+    vy = float(db.var_y[t_idx]) if study_scale else np.nan
     rows = []
     for v_idx in range(db.V):
         z_val = float(z[v_idx])
         if np.isnan(z_val):
             continue
-        if pval is not None:
-            from scipy.stats import norm
-            p = 2 * norm.sf(abs(z_val))
-            if p > pval:
-                continue
-        row = [_variant_label(db, v_idx), tid, round(z_val, 4)]
-        if beta_se:
-            beta_v, se_v = db.beta_se_block([v_idx], [t_idx])
-            row += [round(float(beta_v[0, 0]), 6), round(float(se_v[0, 0]), 6)]
-        rows.append(row)
-    _print_table(header, rows, fmt, fh)
+        if pval is not None and _compute_pval(z_val) > pval:
+            continue
+        beta_v, se_v = db.beta_se_block([v_idx], [t_idx])
+        rows.append(_make_row(
+            _variant_label(db, v_idx), tid, z_val,
+            float(beta_v[0, 0]), float(se_v[0, 0]),
+            study_scale=study_scale, var_y_t=vy,
+        ))
+    _print_table(_header(study_scale), rows, fmt, fh)
 
 
-def _query_region(db, region_str, pval, fmt, fh, beta_se):
+def _query_region(db, region_str, pval, fmt, fh, study_scale: bool = False):
     chrom, rest = region_str.split(":")
     start, end = (int(x) for x in rest.split("-"))
     v_idx, z_mat = db.zscore_region(chrom, start, end)
-    header = _header(beta_se)
+    var_y = db.var_y if study_scale else None
     rows = []
-    from scipy.stats import norm as _norm
-
     for i, vi in enumerate(v_idx):
         vid = _variant_label(db, int(vi))
         for t_idx in range(db.T):
             z_val = float(z_mat[i, t_idx])
             if np.isnan(z_val):
                 continue
-            if pval is not None:
-                if 2 * _norm.sf(abs(z_val)) > pval:
-                    continue
-            row = [vid, _trait_label(db, t_idx), round(z_val, 4)]
-            if beta_se:
-                beta_v, se_v = db.beta_se_block([int(vi)], [t_idx])
-                row += [round(float(beta_v[0, 0]), 6), round(float(se_v[0, 0]), 6)]
-            rows.append(row)
-    _print_table(header, rows, fmt, fh)
+            if pval is not None and _compute_pval(z_val) > pval:
+                continue
+            beta_v, se_v = db.beta_se_block([int(vi)], [t_idx])
+            vy = float(var_y[t_idx]) if study_scale else np.nan
+            rows.append(_make_row(
+                vid, _trait_label(db, t_idx), z_val,
+                float(beta_v[0, 0]), float(se_v[0, 0]),
+                study_scale=study_scale, var_y_t=vy,
+            ))
+    _print_table(_header(study_scale), rows, fmt, fh)
 
 
-def _query_block(db, v_ids, t_ids, pval, fmt, fh, beta_se):
+def _query_block(db, v_ids, t_ids, pval, fmt, fh, study_scale: bool = False):
     v_idx = np.arange(db.V, dtype=np.int64) if v_ids is None else db.variant_index(v_ids)
     t_idx = np.arange(db.T, dtype=np.int64) if t_ids is None else db.trait_index(t_ids)
     z_mat = db.zscore_block(v_idx, t_idx)
-    header = _header(beta_se)
+    var_y = db.var_y if study_scale else None
     rows = []
-    from scipy.stats import norm as _norm
-
     for i, vi in enumerate(v_idx):
         vid = _variant_label(db, int(vi))
         for j, ti in enumerate(t_idx):
             z_val = float(z_mat[i, j])
             if np.isnan(z_val):
                 continue
-            if pval is not None:
-                if 2 * _norm.sf(abs(z_val)) > pval:
-                    continue
-            row = [vid, _trait_label(db, int(ti)), round(z_val, 4)]
-            if beta_se:
-                beta_v, se_v = db.beta_se_block([int(vi)], [int(ti)])
-                row += [round(float(beta_v[0, 0]), 6), round(float(se_v[0, 0]), 6)]
-            rows.append(row)
-    _print_table(header, rows, fmt, fh)
+            if pval is not None and _compute_pval(z_val) > pval:
+                continue
+            beta_v, se_v = db.beta_se_block([int(vi)], [int(ti)])
+            vy = float(var_y[ti]) if study_scale else np.nan
+            rows.append(_make_row(
+                vid, _trait_label(db, int(ti)), z_val,
+                float(beta_v[0, 0]), float(se_v[0, 0]),
+                study_scale=study_scale, var_y_t=vy,
+            ))
+    _print_table(_header(study_scale), rows, fmt, fh)
 
 
-def _query_pval(db, pval, fmt, fh, beta_se):
+def _query_pval(db, pval, fmt, fh, study_scale: bool = False):
     v_idx, t_idx, z_vals = db.query_significant(pval=pval)
-    header = _header(beta_se)
+    var_y = db.var_y if study_scale else None
     rows = []
     for vi, ti, zv in zip(v_idx, t_idx, z_vals):
-        row = [_variant_label(db, int(vi)), _trait_label(db, int(ti)), round(float(zv), 4)]
-        if beta_se:
-            beta_v, se_v = db.beta_se_block([int(vi)], [int(ti)])
-            row += [round(float(beta_v[0, 0]), 6), round(float(se_v[0, 0]), 6)]
-        rows.append(row)
-    _print_table(header, rows, fmt, fh)
+        z_val = float(zv)
+        beta_v, se_v = db.beta_se_block([int(vi)], [int(ti)])
+        vy = float(var_y[ti]) if study_scale else np.nan
+        rows.append(_make_row(
+            _variant_label(db, int(vi)), _trait_label(db, int(ti)), z_val,
+            float(beta_v[0, 0]), float(se_v[0, 0]),
+            study_scale=study_scale, var_y_t=vy,
+        ))
+    _print_table(_header(study_scale), rows, fmt, fh)
 
 
 # ---------------------------------------------------------------------------
