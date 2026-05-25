@@ -311,6 +311,49 @@ def _load_variants(
     return np.array(rows, dtype=dt), np.array(eaf_list, dtype=np.float32)
 
 
+def _write_traits_tsv(
+    path: Path,
+    traits: list["TraitInfo"],
+    var_y_arr: np.ndarray,
+    n_variants_arr: np.ndarray,
+    n_variants_var_y_arr: np.ndarray,
+    pval_thresholds: Sequence[float],
+    n_sig_per_trait: dict[float, np.ndarray],
+) -> None:
+    """Write ``traits.tsv`` — the per-trait metadata file inside .pleiodb.
+
+    Format (tab-separated, header row)::
+
+        trait_id  trait_name  N  K  neff_study  var_y  n_variants  n_variants_var_y
+            n_sig_5e-8  n_sig_1e-5  ...
+
+    Row order matches the T-axis of all binary matrices.  Empty string is used
+    for ``K`` (continuous traits) and ``var_y`` when estimation failed.
+    """
+    sig_cols = [f"n_sig_{p:.0e}".replace("+", "") for p in pval_thresholds]
+    header = (
+        ["trait_id", "trait_name", "N", "K", "neff_study", "var_y",
+         "n_variants", "n_variants_var_y"]
+        + sig_cols
+    )
+    with open(path, "w") as fh:
+        fh.write("\t".join(header) + "\n")
+        for i, t in enumerate(traits):
+            neff_study = compute_neff_study(t.N, t.K)
+            var_y = float(var_y_arr[i])
+            var_y_str = f"{var_y:.6g}" if np.isfinite(var_y) else ""
+            k_str = f"{t.K:.6g}" if t.K is not None else ""
+            sig_vals = [str(int(n_sig_per_trait.get(p, np.zeros(len(traits)))[i]))
+                        for p in pval_thresholds]
+            row = (
+                [t.trait_id, t.trait_name, str(t.N), k_str,
+                 f"{neff_study:.6g}", var_y_str,
+                 str(int(n_variants_arr[i])), str(int(n_variants_var_y_arr[i]))]
+                + sig_vals
+            )
+            fh.write("\t".join(row) + "\n")
+
+
 def _write_variants_tsv(
     path: Path,
     variants: np.ndarray,
@@ -458,20 +501,16 @@ def build_database(
     # ---- Write variant metadata (TSV replaces variants.npy + eaf.f16) ------
     _write_variants_tsv(out / "variants.tsv", variants, eaf)
 
-    trait_dt = np.dtype([("id", "U64"), ("name", "U256")])
-    trait_arr = np.array(
-        [(t.trait_id, t.trait_name) for t in trait_pairs], dtype=trait_dt
-    )
-    np.save(out / "traits.npy", trait_arr)
-
     # ---- Initialise chunked matrices ---------------------------------------
     zscore_mat = ChunkedMatrix(out / "zscore", (V, T), np.int16, chunk_shape)
     neff_mat = ChunkedMatrix(out / "neff", (V, T), np.uint16, chunk_shape)
     zscore_mat.open_write()
     neff_mat.open_write()
 
-    var_y_arr = np.full(T, np.nan, dtype=np.float64)   # accumulated per-trait var_y
-    neff_base = np.full(T, np.nan, dtype=np.float32)   # per-trait median Neff (fallback)
+    var_y_arr = np.full(T, np.nan, dtype=np.float64)       # accumulated per-trait var_y
+    neff_base = np.full(T, np.nan, dtype=np.float32)       # per-trait median Neff
+    n_variants_arr = np.zeros(T, dtype=np.int64)            # finite z-score counts
+    n_variants_var_y_arr = np.zeros(T, dtype=np.int64)      # variants used for var_y
 
     # ---- Main ingestion loop -----------------------------------------------
     for t_block_start in range(0, T, CT):
@@ -502,6 +541,9 @@ def build_database(
             global_t = t_block_start + j
             neff_study = compute_neff_study(t.N, t.K)
 
+            # Count matched variants (finite z-scores) for this trait
+            n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
+
             # Validate that the VCF contained usable SE values
             if not np.any(np.isfinite(se_block[:, j])):
                 raise ValueError(
@@ -512,6 +554,7 @@ def build_database(
             try:
                 vy, n_used = estimate_var_y(se_block[:, j], eaf, neff_study)
                 var_y_arr[global_t] = vy
+                n_variants_var_y_arr[global_t] = n_used
                 log.info(
                     "  var_y[%s] = %.4f  (from %d variants, Neff_study=%.0f)",
                     t.trait_id, vy, n_used, neff_study,
@@ -537,12 +580,20 @@ def build_database(
     zscore_mat.close_write()
     neff_mat.close_write()
 
-    # ---- Neff base (median derived Neff per trait) -------------------------
-    neff_base.tofile(out / "neff_base.f32")
-
     # ---- Significance masks ------------------------------------------------
     log.info("Building significance masks (%s)…", pval_thresholds)
-    _build_masks(out, zscore_mat, V, T, pval_thresholds)
+    n_sig_per_trait = _build_masks(out, zscore_mat, V, T, pval_thresholds)
+
+    # ---- Trait metadata TSV (replaces traits.npy + neff_base.f32) ----------
+    _write_traits_tsv(
+        out / "traits.tsv",
+        trait_pairs,
+        var_y_arr,
+        n_variants_arr,
+        n_variants_var_y_arr,
+        pval_thresholds,
+        n_sig_per_trait,
+    )
 
     # ---- Clean up temp files -----------------------------------------------
     for rf in [direct_regions_file] + list(_lifted_regions_cache.values()):
@@ -582,7 +633,14 @@ def _build_masks(
     V: int,
     T: int,
     thresholds: Sequence[float],
-) -> None:
+) -> dict[float, np.ndarray]:
+    """Write COO significance masks and return per-trait hit counts.
+
+    Returns
+    -------
+    dict mapping each p-value threshold to a length-T integer array of hit
+    counts per trait.
+    """
     from .quantize import decode_z
     from scipy.stats import norm  # type: ignore
 
@@ -605,6 +663,7 @@ def _build_masks(
                     ))
         log.info("mask scan: v-block %d/%d", vi + 1, zscore_mat.n_v_chunks)
 
+    n_sig_per_trait: dict[float, np.ndarray] = {}
     for p, batches in hits.items():
         if batches:
             v_all = np.concatenate([b[0] for b in batches])
@@ -614,11 +673,17 @@ def _build_masks(
             t_all = np.array([], dtype=np.uint32)
 
         order = np.lexsort((t_all, v_all))
-        pairs = np.column_stack([v_all[order], t_all[order]])
+        pairs = np.column_stack([v_all[order], t_all[order]]) if len(v_all) else \
+            np.empty((0, 2), dtype=np.uint32)
         blob = _CCTX.compress(pairs.tobytes())
         mask_name = f"{p:.0e}".replace("+", "")
         (out / "masks" / f"{mask_name}.coo.zst").write_bytes(blob)
         log.info("  mask %s: %d hits", mask_name, len(v_all))
+
+        counts = np.bincount(t_all.astype(np.int64), minlength=T).astype(np.int64)
+        n_sig_per_trait[p] = counts
+
+    return n_sig_per_trait
 
 
 # ---------------------------------------------------------------------------

@@ -336,3 +336,90 @@ class TestNeffDerivedFromSE:
             f"SE_norm from Neff = {se_norm_from_neff:.5f}, "
             f"expected SE_vcf/sqrt(var_y) ≈ {se_norm_expected:.5f}  (5% tolerance)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — traits.tsv storage format (issue #12)
+# ---------------------------------------------------------------------------
+
+class TestTraitsTsv:
+    """Verify that build_database writes traits.tsv and not traits.npy / neff_base.f32."""
+
+    def test_traits_tsv_written(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        assert (db_path / "traits.tsv").exists(), "traits.tsv should be written"
+
+    def test_legacy_files_absent(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        assert not (db_path / "traits.npy").exists(), "traits.npy should not be written"
+        assert not (db_path / "neff_base.f32").exists(), "neff_base.f32 should not be written"
+
+    def test_traits_tsv_header(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        with open(db_path / "traits.tsv") as f:
+            header = f.readline().strip().split("\t")
+        required = {"trait_id", "trait_name", "N", "K", "neff_study", "var_y",
+                    "n_variants", "n_variants_var_y"}
+        assert required.issubset(set(header)), (
+            f"Missing columns: {required - set(header)}"
+        )
+
+    def test_traits_tsv_row_count(self, tmp_path):
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        lines = (db_path / "traits.tsv").read_text().strip().splitlines()
+        assert len(lines) == 6, f"expected 6 (5 traits + 1 header), got {len(lines)}"
+
+    def test_db_traits_reads_correctly(self, tmp_path):
+        """GWASDatabase.traits must return a structured array with id and name fields."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        t = db.traits
+        assert len(t) == 5
+        assert "id" in t.dtype.names
+        assert "name" in t.dtype.names
+
+    def test_trait_index_works(self, tmp_path):
+        """trait_index must correctly resolve SPOT_TRAIT from traits.tsv."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        idx = db.trait_index([SPOT_TRAIT])
+        assert len(idx) == 1 and 0 <= idx[0] < 5
+
+    def test_neff_base_from_traits_tsv(self, tmp_path):
+        """db.neff_base must return a float32 array of length T read from traits.tsv."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        nb = db.neff_base
+        assert len(nb) == 5
+        assert nb.dtype == np.float32
+        assert np.all(np.isfinite(nb) & (nb > 0)), \
+            f"neff_base has non-positive or non-finite entries: {nb}"
+
+    def test_n_variants_column_populated(self, tmp_path):
+        """n_variants column must be positive integers for all traits."""
+        import csv
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        with open(db_path / "traits.tsv") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                n_v = int(row["n_variants"])
+                assert n_v > 0, f"n_variants=0 for trait {row['trait_id']}"
+
+    def test_var_y_column_matches_meta(self, tmp_path):
+        """var_y in traits.tsv must match the values in meta.json."""
+        import json
+        import csv
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        meta_var_y = json.loads((db_path / "meta.json").read_text())["var_y"]
+        with open(db_path / "traits.tsv") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            rows = list(reader)
+        for i, row in enumerate(rows):
+            tsv_vy_str = row["var_y"]
+            meta_vy = meta_var_y[i]
+            if meta_vy is None:
+                assert tsv_vy_str == "", f"Expected empty var_y for trait {i}"
+            else:
+                assert abs(float(tsv_vy_str) - meta_vy) < 1e-4, (
+                    f"var_y mismatch at trait {i}: tsv={tsv_vy_str}, meta={meta_vy}"
+                )
