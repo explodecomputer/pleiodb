@@ -453,7 +453,7 @@ class TestQueryOutput:
         _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
         fh.seek(0)
         header = fh.readline().strip().split("\t")
-        assert header == ["variant_id", "trait_id", "z", "beta_norm", "se_norm", "pval"], (
+        assert header == ["alid", "trait_id", "z", "beta_norm", "se_norm", "pval"], (
             f"Unexpected header: {header}"
         )
 
@@ -590,3 +590,143 @@ class TestStudyScaleBeta:
         result = runner.invoke(main, ["query", "--help"])
         assert "--study-scale" in result.output, \
             "--study-scale flag missing from CLI help"
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — Output column renamed from variant_id to alid (#27)
+# ---------------------------------------------------------------------------
+
+class TestAlidColumnName:
+    """Output header must use 'alid', not 'variant_id', for consistency with
+    variants.tsv (#27)."""
+
+    def test_header_first_column_is_alid(self, tmp_path):
+        """The first column of query output must be 'alid'."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert header[0] == "alid", (
+            f"First column should be 'alid', got '{header[0]}'"
+        )
+
+    def test_header_no_variant_id(self, tmp_path):
+        """The string 'variant_id' must not appear in the output header."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert "variant_id" not in header, (
+            f"'variant_id' should be renamed to 'alid'; got header: {header}"
+        )
+
+    def test_full_header_with_alid(self, tmp_path):
+        """Full header matches expected column order with 'alid'."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert header == ["alid", "trait_id", "z", "beta_norm", "se_norm", "pval"], (
+            f"Unexpected header: {header}"
+        )
+
+    def test_study_scale_header_with_alid(self, tmp_path):
+        """--study-scale header must also start with 'alid'."""
+        from pleiodb.cli import _query_single_variant
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        fh = io.StringIO()
+        _query_single_variant(db, SPOT_ALID, None, "tsv", fh, study_scale=True)
+        fh.seek(0)
+        header = fh.readline().strip().split("\t")
+        assert header == [
+            "alid", "trait_id", "z", "beta_norm", "se_norm", "pval",
+            "beta_study", "se_study",
+        ], f"Unexpected study-scale header: {header}"
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — --variant + --trait returns intersection only (#25)
+# ---------------------------------------------------------------------------
+
+def _query_intersect_rows(db_path, variant_id, trait_id):
+    """Helper: call _query_block with a single variant + single trait."""
+    from pleiodb.cli import _query_block
+    db = _open(db_path)
+    fh = io.StringIO()
+    _query_block(db, [variant_id], [trait_id], None, "tsv", fh)
+    fh.seek(0)
+    return list(csv.DictReader(fh, delimiter="\t"))
+
+
+class TestQueryIntersect:
+    """Combining --variant and --trait returns only the single intersection
+    cell, not all traits for the variant (#25)."""
+
+    def test_returns_exactly_one_row(self, tmp_path):
+        """Querying one variant + one trait yields exactly one result row."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_intersect_rows(db_path, SPOT_ALID, SPOT_TRAIT)
+        assert len(rows) == 1, (
+            f"Expected 1 row from variant+trait intersection, got {len(rows)}"
+        )
+
+    def test_row_has_correct_alid(self, tmp_path):
+        """The single row has the requested variant ALID."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_intersect_rows(db_path, SPOT_ALID, SPOT_TRAIT)
+        assert rows[0]["alid"] == SPOT_ALID
+
+    def test_row_has_correct_trait(self, tmp_path):
+        """The single row has the requested trait ID."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        rows = _query_intersect_rows(db_path, SPOT_ALID, SPOT_TRAIT)
+        assert rows[0]["trait_id"] == SPOT_TRAIT
+
+    def test_cli_variant_and_trait_flags_dispatch_to_block(self, tmp_path):
+        """CLI --variant --trait goes through _query_block (intersection path)."""
+        import click.testing
+        from pleiodb.cli import main
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        runner = click.testing.CliRunner()
+        result = runner.invoke(
+            main,
+            ["query", str(db_path), "--variant", SPOT_ALID, "--trait", SPOT_TRAIT],
+        )
+        assert result.exit_code == 0, f"CLI failed: {result.output}"
+        lines = [l for l in result.output.strip().splitlines() if l]
+        # 1 header + 1 data row = 2 lines
+        assert len(lines) == 2, (
+            f"Expected header + 1 row, got {len(lines)} lines:\n{result.output}"
+        )
+        data_cols = lines[1].split("\t")
+        assert data_cols[0] == SPOT_ALID
+        assert data_cols[1] == SPOT_TRAIT
+
+    def test_pval_filter_applied_to_intersection(self, tmp_path):
+        """--pval filter still applies when --variant and --trait are combined."""
+        from pleiodb.cli import _query_block
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        # The spot variant has a very significant z in SPOT_TRAIT; use a tiny
+        # threshold that it should pass, and a strict one that it should fail.
+        fh_pass = io.StringIO()
+        _query_block(db, [SPOT_ALID], [SPOT_TRAIT], pval=0.99, fmt="tsv", fh=fh_pass)
+        fh_pass.seek(0)
+        rows_pass = list(csv.DictReader(fh_pass, delimiter="\t"))
+        assert len(rows_pass) == 1, "Expected 1 row when pval threshold is permissive"
+
+        fh_fail = io.StringIO()
+        _query_block(db, [SPOT_ALID], [SPOT_TRAIT], pval=1e-300, fmt="tsv", fh=fh_fail)
+        fh_fail.seek(0)
+        rows_fail = list(csv.DictReader(fh_fail, delimiter="\t"))
+        assert len(rows_fail) == 0, "Expected 0 rows when pval threshold is impossibly strict"

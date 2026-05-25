@@ -119,9 +119,9 @@ def compute_lambda(db_path, workers, null_thresh):
 @main.command()
 @click.argument("db_path")
 @click.option("--variant", "-s", default=None,
-              help="Single variant ID → all traits")
+              help="Single ALID → all traits (or just --trait if also given)")
 @click.option("--trait", "-t", default=None,
-              help="Single trait ID → all variants")
+              help="Single trait ID → all variants (or just --variant if also given)")
 @click.option("--region", "-r", default=None,
               help="Genomic region chr:start-end → all traits")
 @click.option("--variants-file", default=None,
@@ -142,7 +142,7 @@ def query(db_path, variant, trait, region, variants_file, traits_file, pval, out
           fmt, study_scale):
     """Query z-scores, normalised beta/SE, and p-values from the database.
 
-    Every row in the output contains: variant_id, trait_id, z, beta_norm,
+    Every row in the output contains: alid, trait_id, z, beta_norm,
     se_norm, pval.  beta_norm and se_norm are on the var(y)=1 scale;
     pval = 2·Φ(−|Z|) (two-sided).
 
@@ -156,6 +156,10 @@ def query(db_path, variant, trait, region, variants_file, traits_file, pval, out
         if pval is not None and variant is None and trait is None and region is None \
                 and variants_file is None and traits_file is None:
             _query_pval(db, pval, fmt, fh, study_scale=study_scale)
+
+        elif variant is not None and trait is not None:
+            # Both specified → return the single intersection cell
+            _query_block(db, [variant], [trait], pval, fmt, fh, study_scale=study_scale)
 
         elif variant is not None:
             _query_single_variant(db, variant, pval, fmt, fh, study_scale=study_scale)
@@ -194,7 +198,7 @@ def _trait_label(db, t_idx: int) -> str:
     return str(db.traits["id"][t_idx])
 
 
-_QUERY_HEADER = ["variant_id", "trait_id", "z", "beta_norm", "se_norm", "pval"]
+_QUERY_HEADER = ["alid", "trait_id", "z", "beta_norm", "se_norm", "pval"]
 _STUDY_EXTRA = ["beta_study", "se_study"]
 
 
