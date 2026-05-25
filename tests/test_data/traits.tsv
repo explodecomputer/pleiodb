@@ -1,6 +1,6 @@
 trait_id	trait_name	N	K	vcf_path	build
 ukb-b-19953	Body mass index	461460		tests/test_data/vcf/ukb-b-19953.vcf.gz	hg19
 ieu-a-7	Coronary artery disease	60801	0.34	tests/test_data/vcf/ieu-a-7.vcf.gz	hg19
-ukb-b-10787	Height	461460		tests/test_data/vcf/ukb-b-10787.vcf.gz	hg19
+ukb-b-10787	Height	461950		tests/test_data/vcf/ukb-b-10787.vcf.gz	hg19
 ieu-b-110	LDL cholesterol	94595		tests/test_data/vcf/ieu-b-110.vcf.gz	hg19
 ieu-b-109	HDL cholesterol	94595		tests/test_data/vcf/ieu-b-109.vcf.gz	hg19
