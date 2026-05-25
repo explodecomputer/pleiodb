@@ -54,6 +54,18 @@ pleiodb query my.pleiodb --pval 1e-5
 
 # Single trait, genome-wide
 pleiodb query my.pleiodb --trait ieu-a-7
+
+# All associations passing p ≤ 1×10⁻⁵ for single
+pleiodb query my.pleiodb --pval 1e-5 --trait ukb-b-10787
+
+# All associations passing p ≤ 1×10⁻⁵ for single trait and variant
+pleiodb query my.pleiodb --pval 1e-5 --trait ukb-b-10787 --variant 2:25121853_A_G
+
+# Intersect for multiple traits and variants
+echo -e "6:36454223_A_T\n1:89472196_A_G" > v.txt
+echo -e "ukb-b-10787\nieu-a-7" > t.txt
+pleiodb query my.pleiodb --traits-file t.txt --variants-file v.txt
+pleiodb query my.pleiodb --traits-file t.txt --variants-file v.txt --pval 1e-5
 ```
 
 ## CLI reference
