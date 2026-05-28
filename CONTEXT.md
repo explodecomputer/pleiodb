@@ -25,7 +25,7 @@ _Avoid_: ID-based matching
 ### Traits and data
 
 **Trait**:
-A GWAS phenotype represented as a column in the V×T matrix. Identified by a `trait_id` string (e.g. `ieu-a-7`).
+A GWAS phenotype represented as a column in the V×T matrix. Identified by a `trait_id` string (e.g. `ieu-a-7`). Trait IDs must not contain commas — commas are used as the delimiter when supplying a list of trait IDs on the command line.
 
 **GWAS-VCF**:
 A VCF file following the MRC IEU GWAS-VCF specification. Source of z-scores and sample sizes per variant per trait.
@@ -70,6 +70,13 @@ The unit of compressed storage: a rectangular submatrix of fixed size (default 5
 
 **Significance mask**:
 A Zstandard-compressed COO-format sparse array of (v_idx, t_idx) pairs for all associations passing a p-value threshold. Enables O(hits) p-value queries.
+
+**rho (sample-overlap-weighted phenotypic correlation)**:
+A symmetric T×T matrix. Each cell `rho[j, k]` estimates the quantity `ρ_pheno × N_overlap[j,k] / √(N_j × N_k)` — the product of the phenotypic correlation between traits j and k and the fraction of shared samples (normalised by study sizes). This is a single combined quantity; phenotypic correlation and sample overlap cannot be separated from it without external information. Estimated from z-scores of null variants (|z_j| < z_threshold AND |z_k| < z_threshold, default z_threshold = 1.0) in the stored z-score matrix using a conditional maximum-likelihood estimator that corrects for the selection bias introduced by thresholding. Stored as `rho.bin/.cidx` (float16, symmetric). Computed as a separate post-build step via `pleiodb rho`. Used downstream for z-score correction, multivariate models, pleiotropy tests, and conditional F-statistics.
+_Avoid_: "lambda" (collides with the per-trait genomic inflation factor λ = median(χ²)/0.456); "cross-trait intercept" (implies LDSC methodology specifically); "sample overlap matrix" (ignores the phenotypic correlation component); "Pearson correlation of null z-scores" (the stored value is the CML estimate, not the raw Pearson r).
+
+**rho query interface**:
+`pleiodb rho <db> --traits t1,t2,t3` or `pleiodb rho <db> --traits-file path` selects a subset of traits and returns pairwise rho values. Default output is a **pairwise list** (columns: `trait_id_1`, `trait_id_2`, `rho`) with one row per unique unordered pair. The `--matrix` flag pivots to a square matrix with trait IDs as both row labels and column headers. The `--traits`/`--traits-file` flags put the command into query mode; omitting both triggers computation of the full rho matrix (the post-build step).
 
 ## Input file formats
 

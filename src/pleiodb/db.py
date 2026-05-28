@@ -132,6 +132,7 @@ class GWASDatabase:
         self._neff: ChunkedMatrix | None = None
         self._eaf: np.ndarray | None = None
         self._lambda: ChunkedMatrix | None = None
+        self._rho: ChunkedMatrix | None = None
 
     # ------------------------------------------------------------------
     # Open / close
@@ -218,6 +219,27 @@ class GWASDatabase:
             cs = self._meta.get("lambda_chunk_shape", [512, 512])
             self._lambda = ChunkedMatrix(self.path / "lambda", (T, T), np.float16, tuple(cs))
         return self._lambda
+
+    @property
+    def rho_matrix(self) -> ChunkedMatrix:
+        """T×T sample-overlap-weighted phenotypic correlation matrix (float16)."""
+        if self._rho is None:
+            T = self.T
+            cs = self._meta.get("rho_chunk_shape", [512, 512])
+            self._rho = ChunkedMatrix(self.path / "rho", (T, T), np.float16, tuple(cs))
+        return self._rho
+
+    def get_rho_block(
+        self, t_indices_row: Sequence[int], t_indices_col: Sequence[int]
+    ) -> np.ndarray:
+        """Return a sub-block of the rho matrix as float32."""
+        tr = np.asarray(t_indices_row, np.int64)
+        tc = np.asarray(t_indices_col, np.int64)
+        t_min = int(min(tr.min(), tc.min()))
+        t_max = int(max(tr.max(), tc.max())) + 1
+        raw = self.rho_matrix.get_block(t_min, t_max, t_min, t_max)
+        block = raw.astype(np.float32)
+        return block[np.ix_(tr - t_min, tc - t_min)]
 
     # ------------------------------------------------------------------
     # Variant / trait index resolution
@@ -387,10 +409,14 @@ class GWASDatabase:
         try:
             zbin = self.path / "zscore.bin"
             nbin = self.path / "neff.bin"
-            lbin = self.path / "lambda.bin"
+            rbin = self.path / "rho.bin"
             m["zscore_size_GB"] = round(zbin.stat().st_size / 1e9, 2) if zbin.exists() else None
             m["neff_size_GB"] = round(nbin.stat().st_size / 1e9, 2) if nbin.exists() else None
-            m["lambda_size_GB"] = round(lbin.stat().st_size / 1e9, 2) if lbin.exists() else None
+            m["rho_present"] = rbin.exists()
+            if not rbin.exists():
+                m.setdefault("warnings", []).append(
+                    "rho matrix absent — run 'pleiodb rho <db>' to compute"
+                )
         except Exception:
             pass
         return m

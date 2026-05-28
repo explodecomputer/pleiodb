@@ -730,3 +730,273 @@ class TestQueryIntersect:
         fh_fail.seek(0)
         rows_fail = list(csv.DictReader(fh_fail, delimiter="\t"))
         assert len(rows_fail) == 0, "Expected 0 rows when pval threshold is impossibly strict"
+
+
+# ---------------------------------------------------------------------------
+# Test — build_rho + GWASDatabase.rho_matrix (issues #32, #33)
+# ---------------------------------------------------------------------------
+
+class TestBuildRho:
+    """Integration tests for build_rho and the resulting rho_matrix property."""
+
+    @pytest.fixture(scope="class")
+    def db_with_rho(self, tmp_path_factory):
+        from pleiodb.build import build_rho
+        tmp = tmp_path_factory.mktemp("rho")
+        db_path = _build(tmp, VARIANTS_HG19)
+        # min_nulls=50: test dataset has ~500 variants, z_thresh=1.0 retains ~46%
+        # per pair → ~230 null variants, below the default 500.
+        build_rho(db_path, z_null_thresh=1.0, min_nulls=50, workers=2)
+        return db_path
+
+    def test_rho_files_exist(self, db_with_rho):
+        assert (db_with_rho / "rho.bin").exists()
+        assert (db_with_rho / "rho.cidx").exists()
+
+    def test_diagonal_is_one(self, db_with_rho):
+        db = _open(db_with_rho)
+        mat = db.rho_matrix
+        for t in range(db.T):
+            block = mat.get_block(t, t + 1, t, t + 1)
+            assert abs(float(block[0, 0]) - 1.0) < 1e-3, (
+                f"rho[{t},{t}] = {float(block[0,0]):.4f}, expected 1.0"
+            )
+
+    def test_off_diagonal_in_range(self, db_with_rho):
+        db = _open(db_with_rho)
+        mat = db.rho_matrix
+        for j in range(db.T):
+            for k in range(db.T):
+                if j == k:
+                    continue
+                val = float(mat.get_block(j, j + 1, k, k + 1)[0, 0])
+                if not np.isnan(val):
+                    assert -1.0 < val < 1.0, (
+                        f"rho[{j},{k}] = {val:.4f} outside (-1, 1)"
+                    )
+
+    def test_symmetry(self, db_with_rho):
+        db = _open(db_with_rho)
+        mat = db.rho_matrix
+        for j in range(db.T):
+            for k in range(j + 1, db.T):
+                vjk = float(mat.get_block(j, j + 1, k, k + 1)[0, 0])
+                vkj = float(mat.get_block(k, k + 1, j, j + 1)[0, 0])
+                both_nan = np.isnan(vjk) and np.isnan(vkj)
+                assert both_nan or abs(vjk - vkj) < 1e-3, (
+                    f"rho[{j},{k}]={vjk:.4f} != rho[{k},{j}]={vkj:.4f}"
+                )
+
+    def test_meta_json_keys(self, db_with_rho):
+        import json
+        meta = json.loads((db_with_rho / "meta.json").read_text())
+        assert "rho_chunk_shape" in meta
+        assert "rho_null_z_thresh" in meta
+        assert "lambda_chunk_shape" not in meta
+        assert "lambda_null_z_thresh" not in meta
+
+
+# ---------------------------------------------------------------------------
+# Test — pleiodb info rho_present warning (issue #33)
+# ---------------------------------------------------------------------------
+
+class TestInfoRhoWarning:
+    def test_info_warns_when_rho_absent(self, tmp_path):
+        """pleiodb info reports rho_present=False and a warning when rho is missing."""
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        db = _open(db_path)
+        info = db.info()
+        assert info["rho_present"] is False
+        assert "warnings" in info
+        assert any("rho" in w.lower() for w in info["warnings"])
+
+    def test_info_no_warning_when_rho_present(self, tmp_path):
+        """pleiodb info reports rho_present=True and no rho warning after build_rho."""
+        from pleiodb.build import build_rho
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        build_rho(db_path, z_null_thresh=1.0, min_nulls=50, workers=2)
+        db = _open(db_path)
+        info = db.info()
+        assert info["rho_present"] is True
+        warnings = info.get("warnings", [])
+        assert not any("rho" in w.lower() for w in warnings)
+
+    def test_pleiodb_info_cli_warns_when_rho_absent(self, tmp_path):
+        """pleiodb info CLI output contains rho_present=false when rho is missing."""
+        import json
+        from click.testing import CliRunner
+        from pleiodb.cli import main
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        runner = CliRunner()
+        result = runner.invoke(main, ["info", str(db_path)])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["rho_present"] is False
+        assert any("rho" in w.lower() for w in data.get("warnings", []))
+
+
+# ---------------------------------------------------------------------------
+# Test — pleiodb rho compute command (issue #34)
+# ---------------------------------------------------------------------------
+
+class TestRhoComputeCommand:
+    def test_compute_exits_zero(self, tmp_path):
+        """pleiodb rho <db> --min-nulls 50 exits 0 and writes rho.bin."""
+        from click.testing import CliRunner
+        from pleiodb.cli import main
+        db_path = _build(tmp_path, VARIANTS_HG19)
+        runner = CliRunner()
+        result = runner.invoke(main, ["rho", str(db_path), "--min-nulls", "50"])
+        assert result.exit_code == 0, result.output
+        assert (db_path / "rho.bin").exists()
+        assert (db_path / "rho.cidx").exists()
+
+    def test_lambda_command_removed_or_deprecated(self, tmp_path):
+        """pleiodb lambda is gone or prints a deprecation notice; does not silently succeed."""
+        from click.testing import CliRunner
+        from pleiodb.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["lambda", "--help"])
+        # Either the command is gone (non-zero / no such command) or it warns about deprecation
+        deprecated = result.exit_code != 0 or "deprecated" in (result.output or "").lower()
+        assert deprecated, (
+            f"'pleiodb lambda' should be removed or warn about deprecation; "
+            f"got exit_code={result.exit_code}, output={result.output!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test — pleiodb rho query mode (issue #35)
+# ---------------------------------------------------------------------------
+
+def _rho_db(tmp_path_factory):
+    """Shared fixture: build a db with rho computed (min_nulls=50)."""
+    from pleiodb.build import build_rho
+    tmp = tmp_path_factory.mktemp("rhoq")
+    db_path = _build(tmp, VARIANTS_HG19)
+    build_rho(db_path, z_null_thresh=1.0, min_nulls=50, workers=2)
+    return db_path
+
+
+class TestRhoQueryMode:
+    @pytest.fixture(scope="class")
+    def db_path(self, tmp_path_factory):
+        return _rho_db(tmp_path_factory)
+
+    def _invoke(self, db_path, *args):
+        from click.testing import CliRunner
+        from pleiodb.cli import main
+        runner = CliRunner()
+        return runner.invoke(main, ["rho", str(db_path)] + list(args))
+
+    def _trait_ids(self, db_path, n=3):
+        """Return the first n trait IDs from the database."""
+        db = _open(db_path)
+        return list(db.traits["id"][:n])
+
+    # --- pairwise list (default) ---
+
+    def test_two_traits_one_row(self, db_path):
+        """--traits t1,t2 → exactly one data row."""
+        t1, t2 = self._trait_ids(db_path, 2)
+        result = self._invoke(db_path, "--traits", f"{t1},{t2}")
+        assert result.exit_code == 0, result.output
+        rows = list(csv.DictReader(io.StringIO(result.output), delimiter="\t"))
+        assert len(rows) == 1
+        assert rows[0]["trait_id_1"] == t1
+        assert rows[0]["trait_id_2"] == t2
+
+    def test_three_traits_three_rows(self, db_path):
+        """--traits t1,t2,t3 → exactly three data rows (all pairs)."""
+        ids = self._trait_ids(db_path, 3)
+        result = self._invoke(db_path, "--traits", ",".join(ids))
+        assert result.exit_code == 0, result.output
+        rows = list(csv.DictReader(io.StringIO(result.output), delimiter="\t"))
+        assert len(rows) == 3
+
+    def test_pairwise_no_diagonal(self, db_path):
+        """Diagonal is never emitted in pairwise output."""
+        ids = self._trait_ids(db_path, 3)
+        result = self._invoke(db_path, "--traits", ",".join(ids))
+        rows = list(csv.DictReader(io.StringIO(result.output), delimiter="\t"))
+        for row in rows:
+            assert row["trait_id_1"] != row["trait_id_2"]
+
+    def test_pairwise_header_columns(self, db_path):
+        """Pairwise output has columns trait_id_1, trait_id_2, rho."""
+        t1, t2 = self._trait_ids(db_path, 2)
+        result = self._invoke(db_path, "--traits", f"{t1},{t2}")
+        rows = list(csv.DictReader(io.StringIO(result.output), delimiter="\t"))
+        assert set(rows[0].keys()) == {"trait_id_1", "trait_id_2", "rho"}
+
+    # --- traits-file ---
+
+    def test_traits_file_same_as_traits_flag(self, db_path, tmp_path):
+        """--traits-file produces same rows as equivalent --traits."""
+        ids = self._trait_ids(db_path, 3)
+        traits_file = tmp_path / "traits.txt"
+        traits_file.write_text("\n".join(ids) + "\n")
+
+        r_flag = self._invoke(db_path, "--traits", ",".join(ids))
+        r_file = self._invoke(db_path, "--traits-file", str(traits_file))
+        assert r_flag.exit_code == 0
+        assert r_file.exit_code == 0
+        assert r_flag.output == r_file.output
+
+    # --- --matrix flag ---
+
+    def test_matrix_diagonal_is_one(self, db_path):
+        """--matrix output has diagonal values = 1.0."""
+        ids = [str(x) for x in self._trait_ids(db_path, 3)]
+        result = self._invoke(db_path, "--traits", ",".join(ids), "--matrix")
+        assert result.exit_code == 0, result.output
+        # Use splitlines() without strip() so the leading tab on the header is preserved
+        lines = result.output.splitlines()
+        # first line is the header row: \t<id1>\t<id2>\t...
+        header = lines[0].split("\t")[1:]   # [0] is the empty cell before the first trait
+        assert header == ids, f"header={header!r}, ids={ids!r}"
+        for i, line in enumerate(lines[1:]):
+            cells = line.split("\t")
+            row_label = cells[0]
+            assert row_label == ids[i]
+            diag_val = float(cells[i + 1])
+            assert abs(diag_val - 1.0) < 1e-3, f"Diagonal [{i},{i}] = {diag_val}"
+
+    def test_matrix_shape(self, db_path):
+        """--matrix output is T×T (T data rows, T+1 columns including label)."""
+        ids = [str(x) for x in self._trait_ids(db_path, 3)]
+        result = self._invoke(db_path, "--traits", ",".join(ids), "--matrix")
+        lines = result.output.splitlines()
+        # header + 3 data rows
+        assert len(lines) == 4
+        for data_line in lines[1:]:
+            assert len(data_line.split("\t")) == len(ids) + 1
+
+    # --- --format json ---
+
+    def test_json_format_valid(self, db_path):
+        """--format json produces valid JSON with correct keys."""
+        import json
+        t1, t2 = self._trait_ids(db_path, 2)
+        result = self._invoke(db_path, "--traits", f"{t1},{t2}", "--format", "json")
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert set(data[0].keys()) == {"trait_id_1", "trait_id_2", "rho"}
+        assert data[0]["trait_id_1"] == t1
+        assert data[0]["trait_id_2"] == t2
+
+    # --- --output flag ---
+
+    def test_output_to_file(self, db_path, tmp_path):
+        """--output writes the result to the specified file instead of stdout."""
+        t1, t2 = self._trait_ids(db_path, 2)
+        out_file = tmp_path / "result.tsv"
+        result = self._invoke(db_path, "--traits", f"{t1},{t2}",
+                              "--output", str(out_file))
+        assert result.exit_code == 0, result.output
+        assert result.output.strip() == ""   # nothing on stdout
+        content = out_file.read_text()
+        rows = list(csv.DictReader(io.StringIO(content), delimiter="\t"))
+        assert len(rows) == 1

@@ -743,3 +743,90 @@ def build_lambda(
     meta["lambda_null_z_thresh"] = z_null_thresh
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     log.info("Lambda matrix written")
+
+
+# ---------------------------------------------------------------------------
+# Rho (CML sample-overlap-weighted phenotypic correlation) computation
+# ---------------------------------------------------------------------------
+
+def build_rho(
+    db_path: str | Path,
+    z_null_thresh: float = 1.0,
+    min_nulls: int = 500,
+    chunk_shape: tuple[int, int] = (512, 512),
+    workers: int = 8,
+) -> None:
+    """Compute the T×T rho matrix and write it to rho.bin/.cidx.
+
+    Parameters
+    ----------
+    db_path     : path to the .pleiodb directory
+    z_null_thresh : z-score threshold for null variant selection (default 1.0)
+    min_nulls   : minimum null variants per pair; pairs below this get NaN
+                  (default 500; set lower for small test databases)
+    chunk_shape : storage chunk shape for rho.bin
+    workers     : parallel workers for pair computation
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    from .db import GWASDatabase
+    from .quantize import decode_z
+    from .rho import estimate_rho_cml
+
+    db = GWASDatabase.open(db_path)
+    out = db.path
+    T = db.T
+
+    # Load the full V×T z-score matrix into memory (float32).
+    # For large databases this could be chunked, but for typical sizes it fits.
+    log.info("rho: loading z-score matrix (%d variants × %d traits)", db.V, T)
+    z_full = decode_z(db._zscore.get_block(0, db.V, 0, T))  # shape (V, T)
+
+    # Compute upper triangle in parallel, store results.
+    rho_vals = np.full((T, T), np.nan, dtype=np.float32)
+    np.fill_diagonal(rho_vals, 1.0)
+
+    # Build list of (j, k) upper-triangle pairs
+    pairs = [(j, k) for j in range(T) for k in range(j + 1, T)]
+
+    def _compute_pair(jk):
+        j, k = jk
+        zj = z_full[:, j]
+        zk = z_full[:, k]
+        mask = (np.abs(zj) < z_null_thresh) & (np.abs(zk) < z_null_thresh)
+        zj_null = zj[mask].astype(np.float32)
+        zk_null = zk[mask].astype(np.float32)
+        return j, k, estimate_rho_cml(zj_null, zk_null,
+                                       z_thresh=z_null_thresh,
+                                       min_nulls=min_nulls)
+
+    log.info("rho: computing %d pairs with %d workers", len(pairs), workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for j, k, val in pool.map(_compute_pair, pairs):
+            rho_vals[j, k] = val
+            rho_vals[k, j] = val  # symmetry
+
+    # Write to chunked matrix
+    rho_mat = ChunkedMatrix(out / "rho", (T, T), np.float16, chunk_shape)
+    rho_mat.open_write()
+
+    CV = chunk_shape[0]
+    CT = chunk_shape[1]
+    for ci in range(rho_mat.n_v_chunks):
+        r0 = ci * CV
+        r1 = min(r0 + CV, T)
+        for cj in range(rho_mat.n_t_chunks):
+            c0 = cj * CT
+            c1 = min(c0 + CT, T)
+            block = rho_vals[r0:r1, c0:c1].astype(np.float16)
+            rho_mat.write_chunk(ci, cj, block)
+
+    rho_mat.close_write()
+
+    # Remove old lambda meta keys if present; write rho meta keys
+    meta = json.loads((out / "meta.json").read_text())
+    meta.pop("lambda_chunk_shape", None)
+    meta.pop("lambda_null_z_thresh", None)
+    meta["rho_chunk_shape"] = list(chunk_shape)
+    meta["rho_null_z_thresh"] = z_null_thresh
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    log.info("Rho matrix written to %s", out / "rho.bin")

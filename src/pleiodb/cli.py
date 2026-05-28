@@ -3,7 +3,7 @@ Command-line interface for pleiodb.
 
 Commands:
   pleiodb build   — create database from GWAS-VCF files
-  pleiodb lambda  — compute/add sample-overlap matrix
+  pleiodb rho     — compute rho matrix, or query it for specific traits
   pleiodb query   — query z-scores, beta, SE
   pleiodb info    — show database summary
 """
@@ -97,19 +97,131 @@ def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwri
 
 
 # ---------------------------------------------------------------------------
-# lambda
+# rho  (dual-mode: compute or query)
 # ---------------------------------------------------------------------------
 
-@main.command("lambda")
+@main.command("rho")
 @click.argument("db_path")
-@click.option("--workers", "-j", default=8, show_default=True)
-@click.option("--null-thresh", default=3.0, show_default=True,
-              help="Max |z| to consider a variant 'null' for correlation")
-def compute_lambda(db_path, workers, null_thresh):
-    """Compute sample-overlap (lambda) matrix and add to database."""
-    from .build import build_lambda
-    build_lambda(db_path, z_null_thresh=null_thresh, workers=workers)
-    click.echo("Lambda matrix complete.")
+# --- compute-mode options ---
+@click.option("--workers", "-j", default=8, show_default=True,
+              help="[compute] Parallel workers for pair computation.")
+@click.option("--null-thresh", default=1.0, show_default=True,
+              help="[compute] Max |z| to consider a variant 'null'.")
+@click.option("--min-nulls", default=500, show_default=True,
+              help="[compute] Min null variants per pair; pairs below threshold get NaN.")
+@click.option("--chunk-size", default=512, show_default=True,
+              help="[compute] Storage chunk size for rho.bin.")
+# --- query-mode options ---
+@click.option("--traits", default=None,
+              help="[query] Comma-separated trait IDs to query.")
+@click.option("--traits-file", default=None,
+              help="[query] File with one trait ID per line.")
+@click.option("--format", "fmt", default="tsv",
+              type=click.Choice(["tsv", "json"]), show_default=True,
+              help="[query] Output format.")
+@click.option("--matrix", "as_matrix", is_flag=True, default=False,
+              help="[query] Pivot output to a square matrix.")
+@click.option("--output", "-o", default=None,
+              help="[query] Output file (default: stdout).")
+def compute_rho(db_path, workers, null_thresh, min_nulls, chunk_size,
+                traits, traits_file, fmt, as_matrix, output):
+    """Compute or query the rho (sample-overlap-weighted correlation) matrix.
+
+    Without --traits / --traits-file: compute the full T×T rho matrix and
+    write it to the database (replaces 'pleiodb lambda').
+
+    With --traits or --traits-file: query stored rho values for the given
+    traits.  Default output is a pairwise list; --matrix gives a square table.
+    """
+    if traits is None and traits_file is None:
+        # ---- compute mode ----
+        from .build import build_rho
+        build_rho(
+            db_path,
+            z_null_thresh=null_thresh,
+            min_nulls=min_nulls,
+            chunk_shape=(chunk_size, chunk_size),
+            workers=workers,
+        )
+        click.echo("Rho matrix complete.")
+    else:
+        # ---- query mode ----
+        _rho_query(db_path, traits, traits_file, fmt, as_matrix, output)
+
+
+# ---------------------------------------------------------------------------
+# rho query helper (issue #35)
+# ---------------------------------------------------------------------------
+
+def _rho_query(db_path, traits_str, traits_file, fmt, as_matrix, output):
+    """Query the rho matrix for a subset of traits."""
+    import sys
+
+    db = _open_db(db_path)
+
+    # Resolve trait list
+    if traits_str is not None:
+        t_ids = [t.strip() for t in traits_str.split(",") if t.strip()]
+    elif traits_file is not None:
+        t_ids = _read_id_file(traits_file)
+    else:
+        raise click.UsageError("Provide --traits or --traits-file for query mode.")
+
+    t_idx = db.trait_index(t_ids)   # raises KeyError if any trait not found
+    T_sub = len(t_ids)
+
+    # Read rho sub-matrix (T_sub × T_sub)
+    rho_sub = np.full((T_sub, T_sub), np.nan, dtype=np.float32)
+    for i, ti in enumerate(t_idx):
+        for j, tj in enumerate(t_idx):
+            rho_sub[i, j] = float(
+                db.rho_matrix.get_block(int(ti), int(ti) + 1, int(tj), int(tj) + 1)[0, 0]
+            )
+
+    fh = open(output, "w") if output else sys.stdout
+    try:
+        if as_matrix:
+            _rho_print_matrix(t_ids, rho_sub, fmt, fh)
+        else:
+            _rho_print_pairwise(t_ids, rho_sub, fmt, fh)
+    finally:
+        if output:
+            fh.close()
+
+
+def _rho_print_pairwise(t_ids, rho_sub, fmt, fh):
+    header = ["trait_id_1", "trait_id_2", "rho"]
+    rows = []
+    n = len(t_ids)
+    for i in range(n):
+        for j in range(i + 1, n):
+            val = float(rho_sub[i, j])
+            rows.append([t_ids[i], t_ids[j], val if not np.isnan(val) else float("nan")])
+    _print_table(header, rows, fmt, fh)
+
+
+def _rho_print_matrix(t_ids, rho_sub, fmt, fh):
+    import sys
+    n = len(t_ids)
+    if fmt == "tsv":
+        print("\t" + "\t".join(t_ids), file=fh)
+        for i, tid in enumerate(t_ids):
+            vals = "\t".join(
+                "nan" if np.isnan(rho_sub[i, j]) else f"{float(rho_sub[i, j]):.6g}"
+                for j in range(n)
+            )
+            print(f"{tid}\t{vals}", file=fh)
+    elif fmt == "json":
+        import json
+        out = {}
+        for i, tid in enumerate(t_ids):
+            out[tid] = {
+                t_ids[j]: (float("nan") if np.isnan(rho_sub[i, j]) else float(rho_sub[i, j]))
+                for j in range(n)
+            }
+        print(json.dumps(out, allow_nan=True), file=fh)
+    else:
+        raise ValueError(f"Unknown format: {fmt}")
 
 
 # ---------------------------------------------------------------------------
