@@ -573,30 +573,13 @@ def build_database(
                 n_done += 1
                 log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
-        # ---- LD imputation (optional) ----------------------------------------
-        imputed_mask_block = np.zeros((V, B), dtype=bool)
-        if block_index:
-            from .impute import impute_z_block
-            impute_z_block(
-                z_block, variants, eaf, block_index,
-                thresh=ld_thresh, min_cor=ld_min_cor,
-                out_mask=imputed_mask_block,
-            )
-            hv, ht = np.where(imputed_mask_block)
-            if len(hv):
-                imputed_coo_v.append(hv.astype(np.uint32))
-                imputed_coo_t.append((ht + t_block_start).astype(np.uint32))
-
         # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
         for j, t in enumerate(batch_traits):
             global_t = t_block_start + j
             neff_study = compute_neff_study(t.N, t.K)
 
-            # n_variants counts only *observed* (pre-imputation) z-scores
-            n_variants_arr[global_t] = int(
-                (np.isfinite(z_block[:, j]) & ~imputed_mask_block[:, j]).sum()
-            )
-            n_imputed_arr[global_t] = int(imputed_mask_block[:, j].sum())
+            # n_variants counts observed finite z-scores; n_imputed filled post-build
+            n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
 
             # Validate that the VCF contained usable SE values
             if not np.any(np.isfinite(se_block[:, j])):
@@ -633,6 +616,57 @@ def build_database(
 
     zscore_mat.close_write()
     neff_mat.close_write()
+
+    # ---- Post-build imputation pass (single pass over all LD blocks) -------
+    if block_index:
+        from .impute import impute_z_block
+        from .quantize import decode_z, decode_neff
+
+        log.info("Post-build imputation pass: loading V×T matrices…")
+        z_full = decode_z(zscore_mat.get_block(0, V, 0, T))        # (V, T) float32
+        neff_full = decode_neff(neff_mat.get_block(0, V, 0, T))    # (V, T) float32
+
+        imputed_mask = np.zeros((V, T), dtype=bool)
+        impute_z_block(
+            z_full, variants, eaf, block_index,
+            thresh=ld_thresh, min_cor=ld_min_cor,
+            out_mask=imputed_mask,
+        )
+
+        # Assign per-trait median Neff to imputed positions so betas are recoverable.
+        # neff[v] = var_y / (SE² × 2·EAF·(1−EAF)) ≈ N_study independent of EAF,
+        # so the trait median is a valid approximation for any imputed variant.
+        neff_full = np.where(imputed_mask, neff_base[np.newaxis, :], neff_full)
+
+        # Update per-trait counts
+        n_imputed_arr[:] = imputed_mask.sum(axis=0)
+        n_variants_arr -= n_imputed_arr   # exclude imputed from observed count
+
+        # Accumulate COO mask
+        hv, ht = np.where(imputed_mask)
+        if len(hv):
+            imputed_coo_v.append(hv.astype(np.uint32))
+            imputed_coo_t.append(ht.astype(np.uint32))
+
+        # Rewrite both files atomically (temp → replace)
+        log.info("Rewriting z-score and Neff files with imputed values…")
+        zscore_tmp = ChunkedMatrix(out / "zscore_tmp", (V, T), np.int16, chunk_shape)
+        neff_tmp = ChunkedMatrix(out / "neff_tmp", (V, T), np.uint16, chunk_shape)
+        zscore_tmp.open_write()
+        neff_tmp.open_write()
+        for vi in range(zscore_mat.n_v_chunks):
+            v0, v1 = vi * CV, min((vi + 1) * CV, V)
+            for ti in range(zscore_mat.n_t_chunks):
+                t0, t1 = ti * CT, min((ti + 1) * CT, T)
+                zscore_tmp.write_chunk(vi, ti, encode_z(z_full[v0:v1, t0:t1]))
+                neff_tmp.write_chunk(vi, ti, encode_neff(neff_full[v0:v1, t0:t1]))
+        zscore_tmp.close_write()
+        neff_tmp.close_write()
+        (out / "zscore_tmp.bin").replace(out / "zscore.bin")
+        (out / "zscore_tmp.cidx").replace(out / "zscore.cidx")
+        (out / "neff_tmp.bin").replace(out / "neff.bin")
+        (out / "neff_tmp.cidx").replace(out / "neff.cidx")
+        log.info("Post-build imputation complete.")
 
     # ---- Imputed-positions mask --------------------------------------------
     _write_imputed_coo(out, imputed_coo_v, imputed_coo_t)

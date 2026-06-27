@@ -1316,3 +1316,148 @@ class TestLiftoverImputation:
         )
         meta = json.loads((db_path / "meta.json").read_text())
         assert meta.get("variants_hg38_stored") is False
+
+
+# ---------------------------------------------------------------------------
+# Test – post-build imputation pass (issue 041)
+# ---------------------------------------------------------------------------
+
+class TestPostBuildImputation:
+    """Verify that imputed positions get finite z-scores and finite Neff."""
+
+    @staticmethod
+    def _make_ld_panel(tmp_path, variants_file):
+        """Minimal synthetic LD panel reused from TestImputation."""
+        import gzip
+
+        variants = []
+        with open(variants_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    alid = line.split("\t")[0]
+                    chrom, rest = alid.split(":", 1)
+                    parts = rest.split("_")
+                    bp = int(parts[0])
+                    variants.append((alid, chrom, bp))
+                if len(variants) >= 4:
+                    break
+
+        if len(variants) < 2:
+            pytest.skip("Not enough variants for LD panel fixture")
+
+        chrom = variants[0][1].lstrip("chr")
+        block_variants = [v for v in variants if v[1].lstrip("chr") == chrom][:2]
+        bps = [v[2] for v in block_variants]
+        start, end = min(bps) - 1000, max(bps) + 1000
+        block_name = f"{start}-{end}"
+        block_dir = tmp_path / chrom / block_name
+        block_dir.mkdir(parents=True)
+
+        tsv_lines = ["CHR\tSNP\tOA\tEA\tEAF\tBP"]
+        for alid, _, bp in block_variants:
+            parts = alid.split("_")
+            a1, a2 = parts[1], parts[2]
+            tsv_lines.append(f"{chrom}\t{alid}\t{a2}\t{a1}\t0.3\t{bp}")
+        (block_dir / f"{block_name}.tsv").write_text("\n".join(tsv_lines) + "\n")
+
+        n = len(block_variants)
+        ld = np.eye(n) + 0.5 * (np.ones((n, n)) - np.eye(n))
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            for row in ld:
+                gz.write(("\t".join(f"{v:.6f}" for v in row) + "\n").encode())
+        (block_dir / f"{block_name}.unphased.vcor1.gz").write_bytes(buf.getvalue())
+
+        return tmp_path
+
+    def _build_with_ld(self, tmp_path):
+        from pleiodb.build import build_database
+        panel_root = self._make_ld_panel(tmp_path / "ld", VARIANTS_HG19)
+        db_path = tmp_path / "test.pleiodb"
+        build_database(
+            output_dir=db_path,
+            variants_path=VARIANTS_HG19,
+            trait_tsv=TRAITS_TSV,
+            chunk_shape=(64, 8),
+            workers=2,
+            ld_dir=panel_root,
+            ld_ancestry="",
+            ld_min_cor=0.0,
+        )
+        return db_path
+
+    def test_observed_z_scores_unchanged(self, tmp_path):
+        """Observed (non-imputed) z-scores must be identical to a build without LD."""
+        from pleiodb.build import build_database
+        from pleiodb.db import GWASDatabase
+        from pleiodb.quantize import decode_z
+
+        # Build without imputation
+        db_no_ld = tmp_path / "no_ld.pleiodb"
+        build_database(
+            output_dir=db_no_ld,
+            variants_path=VARIANTS_HG19,
+            trait_tsv=TRAITS_TSV,
+            chunk_shape=(64, 8),
+            workers=2,
+        )
+
+        # Build with imputation
+        db_ld = self._build_with_ld(tmp_path)
+
+        db_base = GWASDatabase.open(db_no_ld)
+        db_imp = GWASDatabase.open(db_ld)
+
+        z_base = decode_z(db_base._zscore.get_block(0, db_base.V, 0, db_base.T))
+        z_imp = decode_z(db_imp._zscore.get_block(0, db_imp.V, 0, db_imp.T))
+
+        # Observed positions (finite in base) must match in the imputed build
+        observed_mask = np.isfinite(z_base)
+        assert np.allclose(z_base[observed_mask], z_imp[observed_mask], atol=0.01), \
+            "Observed z-scores changed after post-build imputation pass"
+
+    def test_imputed_neff_assigned_from_neff_base(self, tmp_path):
+        """Imputed positions get neff_base[t] so betas are recoverable.
+
+        Patches impute_z_block to force imputation at a known position, then
+        verifies that the rewritten Neff file has a finite value there.
+        """
+        from unittest.mock import patch
+        from pleiodb.build import build_database
+        from pleiodb.db import GWASDatabase
+        from pleiodb.quantize import decode_neff, decode_z
+
+        IMPUTED_V = 0  # force imputation at variant index 0
+
+        def _fake_impute(z_block, variants, eaf_arr, block_index, **kwargs):
+            out_mask = kwargs.get("out_mask")
+            # Impute variant 0 for every trait where it has an observed z-score
+            observed = np.isfinite(z_block[IMPUTED_V, :])
+            if observed.any():
+                z_block[IMPUTED_V, :] = np.where(observed, z_block[IMPUTED_V, :] + 0.0, 99.0)
+                if out_mask is not None:
+                    out_mask[IMPUTED_V, :] = True
+
+        db_path = tmp_path / "forced_impute.pleiodb"
+        with patch("pleiodb.impute.impute_z_block", side_effect=_fake_impute):
+            panel_root = self._make_ld_panel(tmp_path / "ld", VARIANTS_HG19)
+            build_database(
+                output_dir=db_path,
+                variants_path=VARIANTS_HG19,
+                trait_tsv=TRAITS_TSV,
+                chunk_shape=(64, 8),
+                workers=2,
+                ld_dir=panel_root,
+                ld_ancestry="",
+                ld_min_cor=0.0,
+            )
+
+        db = GWASDatabase.open(db_path)
+        neff_full = decode_neff(db._neff.get_block(0, db.V, 0, db.T))
+
+        # Variant 0 should have finite Neff for all traits (assigned from neff_base)
+        for t_idx in range(db.T):
+            n = neff_full[IMPUTED_V, t_idx]
+            assert np.isfinite(n), \
+                f"Imputed Neff at variant 0 trait {t_idx} should be finite, got {n}"
