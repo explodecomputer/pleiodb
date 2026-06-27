@@ -260,18 +260,21 @@ class TestSeOutliers:
 # ---------------------------------------------------------------------------
 
 class TestLoadLdSubmatrix:
+    def _ld_path(self, block_dir):
+        return block_dir / f"{block_dir.name}.unphased.vcor1.gz"
+
     def test_shape_and_values(self, ld_block_dir):
         block_dir, alids, expected_ld = ld_block_dir
         n = len(alids)
         idx = list(range(n))
-        sub = _load_ld_submatrix(block_dir, idx)
+        sub = _load_ld_submatrix(self._ld_path(block_dir), idx)
         assert sub.shape == (n, n)
         np.testing.assert_allclose(sub, expected_ld, atol=1e-5)
 
     def test_submatrix_subset(self, ld_block_dir):
         block_dir, alids, expected_ld = ld_block_dir
         idx = [0, 2, 4]
-        sub = _load_ld_submatrix(block_dir, idx)
+        sub = _load_ld_submatrix(self._ld_path(block_dir), idx)
         assert sub.shape == (3, 3)
         expected_sub = expected_ld[np.ix_(idx, idx)]
         np.testing.assert_allclose(sub, expected_sub, atol=1e-5)
@@ -292,10 +295,11 @@ class TestBuildBlockIndex:
         idx = build_block_index(variants, ld_dir, ancestry="")
 
         assert len(idx) == 1
-        block_path = list(idx.keys())[0]
-        info = idx[block_path]
+        block_key = list(idx.keys())[0]
+        info = idx[block_key]
         assert len(info["variant_indices"]) == 3
         assert len(info["ld_row_indices"]) == 3
+        assert "ld_path" in info
 
     def test_block_excluded_when_fewer_than_2_matches(self, ld_block_dir, tmp_path):
         block_dir, alids, _ = ld_block_dir
@@ -324,6 +328,7 @@ class TestBuildBlockIndex:
         idx = build_block_index(variants, ld_dir, ancestry="")
         info = list(idx.values())[0]
         assert info["n_ld_snps"] == len(alids)
+        assert info["ld_path"].exists()
 
 
 # ---------------------------------------------------------------------------
@@ -336,8 +341,10 @@ class TestImputeZBlock:
         block_dir, _, ld = ld_block_dir
         n = len(alids)
         idxs = list(range(n)) if subset is None else subset
+        ld_path = block_dir / f"{block_dir.name}.unphased.vcor1.gz"
         return {
-            block_dir: {
+            f"1/{block_dir.name}": {
+                "ld_path": ld_path,
                 "variant_indices": idxs,
                 "ld_row_indices": idxs,
                 "n_ld_snps": n,

@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.9.38">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="author" content="Gibran Hemani">
+<meta name="dcterms.date" content="2026-06-27">
+
+<title>Imputation performance benchmark</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.5.1/dist/jquery.min.js" integrity="sha384-ZvpUoO/+PpLXR1lu4jmpXWu80pZlYUAfxl5NsBMWOEPSjUn/6Z/hRTt8+pR6L4N2" crossorigin="anonymous"></script><script src="imputation_benchmark_files/libs/clipboard/clipboard.min.js"></script>
+<script src="imputation_benchmark_files/libs/quarto-html/quarto.js" type="module"></script>
+<script src="imputation_benchmark_files/libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="imputation_benchmark_files/libs/quarto-html/popper.min.js"></script>
+<script src="imputation_benchmark_files/libs/quarto-html/tippy.umd.min.js"></script>
+<script src="imputation_benchmark_files/libs/quarto-html/anchor.min.js"></script>
+<link href="imputation_benchmark_files/libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="imputation_benchmark_files/libs/quarto-html/quarto-syntax-highlighting-15634bcf2e68342d4ad2dfa704d543f6.css" rel="stylesheet" id="quarto-text-highlighting-styles">
+<script src="imputation_benchmark_files/libs/bootstrap/bootstrap.min.js"></script>
+<link href="imputation_benchmark_files/libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="imputation_benchmark_files/libs/bootstrap/bootstrap-cf4f0fd625aba0f0bc7f7a5bc4c3253b.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="light">
+<script src="https://cdn.jsdelivr.net/npm/requirejs@2.3.6/require.min.js" integrity="sha384-c9c+LnTbwQ3aujuU7ULEPVvgLs+Fn6fJUvIGTsuu1ZcCf11fiEubah0ttpca4ntM sha384-6V1/AdqZRWk1KAlWbKBlGhN7VG4iE/yAZcO6NZPMF8od0vukrvr0tg4qY6NSrItx" crossorigin="anonymous"></script>
+
+<script type="application/javascript">define('jquery', [],function() {return window.jQuery;})</script>
+
+
+</head>
+
+<body class="quarto-light">
+
+<div id="quarto-content" class="page-columns page-rows-contents page-layout-article">
+<div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+  <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#overview" id="toc-overview" class="nav-link active" data-scroll-target="#overview">Overview</a></li>
+  <li><a href="#load-data" id="toc-load-data" class="nav-link" data-scroll-target="#load-data">Load data</a></li>
+  <li><a href="#run-imputation-benchmark" id="toc-run-imputation-benchmark" class="nav-link" data-scroll-target="#run-imputation-benchmark">Run imputation benchmark</a></li>
+  <li><a href="#sec-scatter" id="toc-sec-scatter" class="nav-link" data-scroll-target="#sec-scatter">Scatter plots: imputed vs truth</a></li>
+  <li><a href="#sec-manhattan" id="toc-sec-manhattan" class="nav-link" data-scroll-target="#sec-manhattan">Genome position vs z-score</a></li>
+  <li><a href="#distribution-of-errors" id="toc-distribution-of-errors" class="nav-link" data-scroll-target="#distribution-of-errors">Distribution of errors</a></li>
+  <li><a href="#sec-sensitivity" id="toc-sec-sensitivity" class="nav-link" data-scroll-target="#sec-sensitivity">Correlation as a function of mask fraction</a></li>
+  <li><a href="#summary" id="toc-summary" class="nav-link" data-scroll-target="#summary">Summary</a></li>
+  </ul>
+</nav>
+</div>
+<main class="content" id="quarto-document-content">
+
+<header id="title-block-header" class="quarto-title-block default">
+<div class="quarto-title">
+<h1 class="title">Imputation performance benchmark</h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    <div>
+    <div class="quarto-title-meta-heading">Author</div>
+    <div class="quarto-title-meta-contents">
+             <p>Gibran Hemani </p>
+          </div>
+  </div>
+    
+    <div>
+    <div class="quarto-title-meta-heading">Published</div>
+    <div class="quarto-title-meta-contents">
+      <p class="date">June 27, 2026</p>
+    </div>
+  </div>
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<section id="overview" class="level2">
+<h2 class="anchored" data-anchor-id="overview">Overview</h2>
+<p>We evaluate how well the elastic-net LD imputation recovers masked z-scores in two contrasting genomic settings:</p>
+<ol type="1">
+<li><strong>Null region</strong> — chromosome 1 block <code>168414490–169838848</code>, BMI GWAS (<code>ukb-b-19953</code>). No genome-wide significant variants; z-scores are noise.</li>
+<li><strong>Signal region</strong> — chromosome 16 block <code>53815773–55761660</code>, the FTO locus for BMI (<code>ukb-b-19953</code>, N≈462k). Strong association signal (min p ≈ 7×10⁻²⁸).</li>
+</ol>
+<p>For each block we:</p>
+<ol type="1">
+<li>Load the standardised GWAS summary statistics and the LD reference panel.</li>
+<li>Match GWAS SNPs to the LD panel by SNP ID.</li>
+<li>Randomly mask <strong>30 %</strong> of matched variants (set z-scores to NaN).</li>
+<li>Impute the masked values using the PCA + elastic-net method implemented in <code>pleiodb.impute</code>.</li>
+<li>Compare imputed z-scores to the held-out truth.</li>
+</ol>
+<div id="setup" class="cell" data-execution_count="1">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>sys.path.insert(<span class="dv">0</span>, <span class="st">"/home/gh13047/repo/pleiodb/src"</span>)</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> pathlib <span class="im">import</span> Path</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pandas <span class="im">as</span> pd</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> matplotlib.pyplot <span class="im">as</span> plt</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> matplotlib.gridspec <span class="im">as</span> gridspec</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> scipy <span class="im">import</span> stats</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> pleiodb.impute <span class="im">import</span> _ld_pca, _elastic_net_impute, _poly_rescale, _load_ld_submatrix</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>GPMAP <span class="op">=</span> Path(<span class="st">"/local-scratch/projects/genotype-phenotype-map/data"</span>)</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>LD_PANEL <span class="op">=</span> GPMAP <span class="op">/</span> <span class="st">"ld_reference_panel_hg38/EUR"</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Standardised GWAS files (BMI, ukb-b-19953)</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>NULL_GWAS   <span class="op">=</span> GPMAP <span class="op">/</span> <span class="st">"study/ukb-b-19953/standardised/EUR_1_169095392.tsv.gz"</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>SIGNAL_GWAS <span class="op">=</span> GPMAP <span class="op">/</span> <span class="st">"study/ukb-b-19953/standardised/EUR_16_53832063.tsv.gz"</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="co"># Corresponding LD panel blocks</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>NULL_BLOCK   <span class="op">=</span> <span class="st">"1/168414490-169838848"</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>SIGNAL_BLOCK <span class="op">=</span> <span class="st">"16/53815773-55761660"</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>MASK_FRAC <span class="op">=</span> <span class="fl">0.30</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>SEED <span class="op">=</span> <span class="dv">42</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>LD_THRESH <span class="op">=</span> <span class="fl">0.90</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+</div>
+<div id="helpers" class="cell" data-execution_count="2">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb2"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_block(gwas_path: Path, block_str: <span class="bu">str</span>):</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">    Load GWAS + LD panel for one block, inner-join on SNP ID, return a dict with:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">      z_full, eaf, ld_sub, block_name, n_gwas, n_panel, n_matched</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">    """</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    chrom, block_name <span class="op">=</span> block_str.split(<span class="st">"/"</span>, <span class="dv">1</span>)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    tsv_path <span class="op">=</span> LD_PANEL <span class="op">/</span> chrom <span class="op">/</span> <span class="ss">f"</span><span class="sc">{</span>block_name<span class="sc">}</span><span class="ss">.tsv"</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    ld_gz    <span class="op">=</span> LD_PANEL <span class="op">/</span> chrom <span class="op">/</span> <span class="ss">f"</span><span class="sc">{</span>block_name<span class="sc">}</span><span class="ss">.unphased.vcor1.gz"</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    gwas  <span class="op">=</span> pd.read_csv(gwas_path, sep<span class="op">=</span><span class="st">"</span><span class="ch">\t</span><span class="st">"</span>)</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    panel <span class="op">=</span> pd.read_csv(tsv_path, sep<span class="op">=</span><span class="st">"</span><span class="ch">\t</span><span class="st">"</span>)</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Canonical SNP ID: strip "chr" prefix if present</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    gwas[<span class="st">"snp_bare"</span>]  <span class="op">=</span> gwas[<span class="st">"SNP"</span>].<span class="bu">str</span>.lstrip(<span class="st">"chr"</span>)</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    panel[<span class="st">"snp_bare"</span>] <span class="op">=</span> panel[<span class="st">"SNP"</span>].<span class="bu">str</span>.lstrip(<span class="st">"chr"</span>)</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Inner join</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    merged <span class="op">=</span> gwas.merge(panel.reset_index().rename(columns<span class="op">=</span>{<span class="st">"index"</span>: <span class="st">"ld_row"</span>}),</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>                        on<span class="op">=</span><span class="st">"snp_bare"</span>, how<span class="op">=</span><span class="st">"inner"</span>)</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    ld_row_indices <span class="op">=</span> merged[<span class="st">"ld_row"</span>].tolist()</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    ld_sub <span class="op">=</span> _load_ld_submatrix(ld_gz, ld_row_indices)</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">dict</span>(</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        z_full     <span class="op">=</span> merged[<span class="st">"Z"</span>].values.astype(np.float64),</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        eaf        <span class="op">=</span> merged[<span class="st">"EAF_x"</span>].values.astype(np.float64),</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        ld_sub     <span class="op">=</span> ld_sub,</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>        block_name <span class="op">=</span> block_name,</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>        n_gwas     <span class="op">=</span> <span class="bu">len</span>(gwas),</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>        n_panel    <span class="op">=</span> <span class="bu">len</span>(panel),</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        n_matched  <span class="op">=</span> <span class="bu">len</span>(merged),</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run_benchmark(block_data: <span class="bu">dict</span>, mask_frac: <span class="bu">float</span> <span class="op">=</span> MASK_FRAC, seed: <span class="bu">int</span> <span class="op">=</span> SEED,</span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>                  thresh: <span class="bu">float</span> <span class="op">=</span> LD_THRESH):</span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="co">    Mask mask_frac of z-scores, impute, return results dict.</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="co">    """</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    z_full <span class="op">=</span> block_data[<span class="st">"z_full"</span>]</span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    ld_sub <span class="op">=</span> block_data[<span class="st">"ld_sub"</span>]</span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> <span class="bu">len</span>(z_full)</span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    rng <span class="op">=</span> np.random.default_rng(seed)</span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    mask_idx <span class="op">=</span> rng.choice(n, size<span class="op">=</span><span class="bu">int</span>(n <span class="op">*</span> mask_frac), replace<span class="op">=</span><span class="va">False</span>)</span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    z_masked <span class="op">=</span> z_full.copy()</span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>    z_masked[mask_idx] <span class="op">=</span> np.nan</span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    <span class="co"># PCA</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>    eigenvalues, eigenvectors <span class="op">=</span> _ld_pca(ld_sub, thresh<span class="op">=</span>thresh)</span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>    n_comp <span class="op">=</span> <span class="bu">len</span>(eigenvalues)</span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Elastic net imputation</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    z_pred <span class="op">=</span> _elastic_net_impute(z_masked, eigenvectors, n_comp)</span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> z_pred <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">None</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Polynomial rescaling</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>    z_adj, corr <span class="op">=</span> _poly_rescale(z_masked, z_pred, npoly<span class="op">=</span><span class="dv">3</span>)</span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>    truth    <span class="op">=</span> z_full[mask_idx]</span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>    imputed  <span class="op">=</span> z_adj[mask_idx]</span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>    rmse <span class="op">=</span> <span class="bu">float</span>(np.sqrt(np.mean((truth <span class="op">-</span> imputed) <span class="op">**</span> <span class="dv">2</span>)))</span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a>    slope, intercept <span class="op">=</span> np.polyfit(truth, imputed, <span class="dv">1</span>)</span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a>    r2 <span class="op">=</span> corr <span class="op">**</span> <span class="dv">2</span> <span class="cf">if</span> np.isfinite(corr) <span class="cf">else</span> <span class="bu">float</span>(<span class="st">"nan"</span>)</span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">dict</span>(</span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>        truth     <span class="op">=</span> truth,</span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>        imputed   <span class="op">=</span> imputed,</span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>        z_masked  <span class="op">=</span> z_masked,</span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>        z_adj     <span class="op">=</span> z_adj,</span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a>        corr      <span class="op">=</span> corr,</span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>        r2        <span class="op">=</span> r2,</span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>        rmse      <span class="op">=</span> rmse,</span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a>        slope     <span class="op">=</span> slope,</span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>        intercept <span class="op">=</span> intercept,</span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>        n_comp    <span class="op">=</span> n_comp,</span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>        n_masked  <span class="op">=</span> <span class="bu">len</span>(mask_idx),</span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a>        mask_idx  <span class="op">=</span> mask_idx,</span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a>    )</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+</div>
+</section>
+<section id="load-data" class="level2">
+<h2 class="anchored" data-anchor-id="load-data">Load data</h2>
+<div id="cell-load-data" class="cell" data-execution_count="3">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>null_data   <span class="op">=</span> load_block(NULL_GWAS,   NULL_BLOCK)</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>signal_data <span class="op">=</span> load_block(SIGNAL_GWAS, SIGNAL_BLOCK)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>summary <span class="op">=</span> pd.DataFrame([</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"Region"</span>: <span class="st">"Null (chr1)"</span>,   <span class="st">"Block"</span>: null_data[<span class="st">"block_name"</span>],</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>     <span class="st">"GWAS SNPs"</span>: null_data[<span class="st">"n_gwas"</span>], <span class="st">"Panel SNPs"</span>: null_data[<span class="st">"n_panel"</span>],</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Matched"</span>: null_data[<span class="st">"n_matched"</span>],</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Min |Z|"</span>: <span class="ss">f"</span><span class="sc">{</span>np<span class="sc">.</span><span class="bu">abs</span>(null_data[<span class="st">'z_full'</span>])<span class="sc">.</span><span class="bu">min</span>()<span class="sc">:.2f}</span><span class="ss">"</span>,</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Max |Z|"</span>: <span class="ss">f"</span><span class="sc">{</span>np<span class="sc">.</span><span class="bu">abs</span>(null_data[<span class="st">'z_full'</span>])<span class="sc">.</span><span class="bu">max</span>()<span class="sc">:.2f}</span><span class="ss">"</span>},</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"Region"</span>: <span class="st">"Signal (FTO)"</span>,  <span class="st">"Block"</span>: signal_data[<span class="st">"block_name"</span>],</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>     <span class="st">"GWAS SNPs"</span>: signal_data[<span class="st">"n_gwas"</span>], <span class="st">"Panel SNPs"</span>: signal_data[<span class="st">"n_panel"</span>],</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Matched"</span>: signal_data[<span class="st">"n_matched"</span>],</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Min |Z|"</span>: <span class="ss">f"</span><span class="sc">{</span>np<span class="sc">.</span><span class="bu">abs</span>(signal_data[<span class="st">'z_full'</span>])<span class="sc">.</span><span class="bu">min</span>()<span class="sc">:.2f}</span><span class="ss">"</span>,</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Max |Z|"</span>: <span class="ss">f"</span><span class="sc">{</span>np<span class="sc">.</span><span class="bu">abs</span>(signal_data[<span class="st">'z_full'</span>])<span class="sc">.</span><span class="bu">max</span>()<span class="sc">:.2f}</span><span class="ss">"</span>},</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>])</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>summary</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div id="load-data" class="cell-output cell-output-display" data-execution_count="3">
+<div>
+
+
+<table class="dataframe caption-top table table-sm table-striped small" data-border="1">
+<thead>
+<tr class="header">
+<th data-quarto-table-cell-role="th"></th>
+<th data-quarto-table-cell-role="th">Region</th>
+<th data-quarto-table-cell-role="th">Block</th>
+<th data-quarto-table-cell-role="th">GWAS SNPs</th>
+<th data-quarto-table-cell-role="th">Panel SNPs</th>
+<th data-quarto-table-cell-role="th">Matched</th>
+<th data-quarto-table-cell-role="th">Min |Z|</th>
+<th data-quarto-table-cell-role="th">Max |Z|</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<th data-quarto-table-cell-role="th">0</th>
+<td>Null (chr1)</td>
+<td>168414490-169838848</td>
+<td>5452</td>
+<td>6214</td>
+<td>5452</td>
+<td>0.00</td>
+<td>3.88</td>
+</tr>
+<tr class="even">
+<th data-quarto-table-cell-role="th">1</th>
+<td>Signal (FTO)</td>
+<td>53815773-55761660</td>
+<td>7150</td>
+<td>7935</td>
+<td>7150</td>
+<td>0.00</td>
+<td>10.95</td>
+</tr>
+</tbody>
+</table>
+
+</div>
+</div>
+</div>
+</section>
+<section id="run-imputation-benchmark" class="level2">
+<h2 class="anchored" data-anchor-id="run-imputation-benchmark">Run imputation benchmark</h2>
+<div id="cell-run-benchmark" class="cell" data-execution_count="4">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>null_res   <span class="op">=</span> run_benchmark(null_data)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>signal_res <span class="op">=</span> run_benchmark(signal_data)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>metrics <span class="op">=</span> pd.DataFrame([</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"Region"</span>: <span class="st">"Null (chr1)"</span>,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>     <span class="st">"N masked"</span>: null_res[<span class="st">"n_masked"</span>],</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>     <span class="st">"LD components"</span>: null_res[<span class="st">"n_comp"</span>],</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Pearson r"</span>: <span class="ss">f"</span><span class="sc">{</span>null_res[<span class="st">'corr'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>     <span class="st">"R²"</span>: <span class="ss">f"</span><span class="sc">{</span>null_res[<span class="st">'r2'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>     <span class="st">"RMSE"</span>: <span class="ss">f"</span><span class="sc">{</span>null_res[<span class="st">'rmse'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>},</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    {<span class="st">"Region"</span>: <span class="st">"Signal (FTO)"</span>,</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>     <span class="st">"N masked"</span>: signal_res[<span class="st">"n_masked"</span>],</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>     <span class="st">"LD components"</span>: signal_res[<span class="st">"n_comp"</span>],</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>     <span class="st">"Pearson r"</span>: <span class="ss">f"</span><span class="sc">{</span>signal_res[<span class="st">'corr'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>     <span class="st">"R²"</span>: <span class="ss">f"</span><span class="sc">{</span>signal_res[<span class="st">'r2'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>     <span class="st">"RMSE"</span>: <span class="ss">f"</span><span class="sc">{</span>signal_res[<span class="st">'rmse'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>},</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>])</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>metrics</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div id="run-benchmark" class="cell-output cell-output-display" data-execution_count="4">
+<div>
+
+
+<table class="dataframe caption-top table table-sm table-striped small" data-border="1">
+<thead>
+<tr class="header">
+<th data-quarto-table-cell-role="th"></th>
+<th data-quarto-table-cell-role="th">Region</th>
+<th data-quarto-table-cell-role="th">N masked</th>
+<th data-quarto-table-cell-role="th">LD components</th>
+<th data-quarto-table-cell-role="th">Pearson r</th>
+<th data-quarto-table-cell-role="th">R²</th>
+<th data-quarto-table-cell-role="th">RMSE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<th data-quarto-table-cell-role="th">0</th>
+<td>Null (chr1)</td>
+<td>1635</td>
+<td>170</td>
+<td>0.968</td>
+<td>0.937</td>
+<td>0.370</td>
+</tr>
+<tr class="even">
+<th data-quarto-table-cell-role="th">1</th>
+<td>Signal (FTO)</td>
+<td>2145</td>
+<td>430</td>
+<td>0.976</td>
+<td>0.952</td>
+<td>0.432</td>
+</tr>
+</tbody>
+</table>
+
+</div>
+</div>
+</div>
+</section>
+<section id="sec-scatter" class="level2">
+<h2 class="anchored" data-anchor-id="sec-scatter">Scatter plots: imputed vs truth</h2>
+<div id="cell-fig-scatter" class="cell" data-execution_count="5">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>fig, axes <span class="op">=</span> plt.subplots(<span class="dv">1</span>, <span class="dv">2</span>, figsize<span class="op">=</span>(<span class="dv">11</span>, <span class="dv">5</span>))</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> ax, res, title <span class="kw">in</span> <span class="bu">zip</span>(</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    axes,</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    [null_res, signal_res],</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    [<span class="st">"Null region (chr1 168–170 Mb)"</span>, <span class="st">"Signal region (FTO, chr16 53.8–55.8 Mb)"</span>]</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>):</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    truth   <span class="op">=</span> res[<span class="st">"truth"</span>]</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    imputed <span class="op">=</span> res[<span class="st">"imputed"</span>]</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Density scatter</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    xy <span class="op">=</span> np.vstack([truth, imputed])</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>        <span class="im">from</span> scipy.stats <span class="im">import</span> gaussian_kde</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        z <span class="op">=</span> gaussian_kde(xy)(xy)</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        idx <span class="op">=</span> z.argsort()</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        sc <span class="op">=</span> ax.scatter(truth[idx], imputed[idx], c<span class="op">=</span>z[idx], s<span class="op">=</span><span class="dv">6</span>, cmap<span class="op">=</span><span class="st">"viridis"</span>,</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>                        rasterized<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>        plt.colorbar(sc, ax<span class="op">=</span>ax, label<span class="op">=</span><span class="st">"Density"</span>)</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> <span class="pp">Exception</span>:</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        ax.scatter(truth, imputed, s<span class="op">=</span><span class="dv">4</span>, alpha<span class="op">=</span><span class="fl">0.3</span>, color<span class="op">=</span><span class="st">"steelblue"</span>)</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Identity line</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    lim <span class="op">=</span> <span class="bu">max</span>(<span class="bu">abs</span>(truth).<span class="bu">max</span>(), <span class="bu">abs</span>(imputed).<span class="bu">max</span>()) <span class="op">*</span> <span class="fl">1.05</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>    ax.axline((<span class="dv">0</span>, <span class="dv">0</span>), slope<span class="op">=</span><span class="dv">1</span>, color<span class="op">=</span><span class="st">"tomato"</span>, linewidth<span class="op">=</span><span class="fl">1.2</span>, linestyle<span class="op">=</span><span class="st">"--"</span>, label<span class="op">=</span><span class="st">"y=x"</span>)</span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="co"># OLS fit line</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    x_line <span class="op">=</span> np.linspace(<span class="op">-</span>lim, lim, <span class="dv">200</span>)</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>    ax.plot(x_line, res[<span class="st">"slope"</span>] <span class="op">*</span> x_line <span class="op">+</span> res[<span class="st">"intercept"</span>],</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>            color<span class="op">=</span><span class="st">"orange"</span>, linewidth<span class="op">=</span><span class="fl">1.2</span>, label<span class="op">=</span><span class="ss">f"OLS (slope=</span><span class="sc">{</span>res[<span class="st">'slope'</span>]<span class="sc">:.2f}</span><span class="ss">)"</span>)</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>    ax.set_xlim(<span class="op">-</span>lim, lim)</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    ax.set_ylim(<span class="op">-</span>lim, lim)</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    ax.set_xlabel(<span class="st">"True z-score"</span>)</span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    ax.set_ylabel(<span class="st">"Imputed z-score"</span>)</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>    ax.set_title(title, fontsize<span class="op">=</span><span class="dv">10</span>)</span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    ax.legend(fontsize<span class="op">=</span><span class="dv">8</span>)</span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>    ax.text(<span class="fl">0.05</span>, <span class="fl">0.93</span>, <span class="ss">f"r = </span><span class="sc">{</span>res[<span class="st">'corr'</span>]<span class="sc">:.3f}</span><span class="ch">\n</span><span class="ss">RMSE = </span><span class="sc">{</span>res[<span class="st">'rmse'</span>]<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>            transform<span class="op">=</span>ax.transAxes, fontsize<span class="op">=</span><span class="dv">9</span>, verticalalignment<span class="op">=</span><span class="st">"top"</span>,</span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>            bbox<span class="op">=</span><span class="bu">dict</span>(boxstyle<span class="op">=</span><span class="st">"round"</span>, facecolor<span class="op">=</span><span class="st">"wheat"</span>, alpha<span class="op">=</span><span class="fl">0.5</span>))</span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>fig.tight_layout()</span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>plt.show()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output cell-output-display">
+<div id="fig-scatter" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-scatter-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="imputation_benchmark_files/figure-html/fig-scatter-output-1.png" width="1037" height="470" class="figure-img">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-scatter-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;1: Imputed vs true z-scores for 30% masked variants. Colour indicates density.
+</figcaption>
+</figure>
+</div>
+</div>
+</div>
+</section>
+<section id="sec-manhattan" class="level2">
+<h2 class="anchored" data-anchor-id="sec-manhattan">Genome position vs z-score</h2>
+<p>Visualise the observed z-score profile and overlay the imputed values to confirm they are consistent with the neighbouring signal.</p>
+<div id="cell-fig-manhattan" class="cell" data-execution_count="6">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb6"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> position_from_snp(snp_series: pd.Series) <span class="op">-&gt;</span> np.ndarray:</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">"""Extract base-pair position from SNP IDs like '16:53815891_A_G'."""</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> snp_series.<span class="bu">str</span>.split(<span class="st">":"</span>, expand<span class="op">=</span><span class="va">True</span>)[<span class="dv">1</span>].<span class="bu">str</span>.split(<span class="st">"_"</span>, expand<span class="op">=</span><span class="va">True</span>)[<span class="dv">0</span>].astype(<span class="bu">int</span>).values</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>fig, axes <span class="op">=</span> plt.subplots(<span class="dv">2</span>, <span class="dv">1</span>, figsize<span class="op">=</span>(<span class="dv">12</span>, <span class="dv">8</span>))</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> ax, data, res, title <span class="kw">in</span> <span class="bu">zip</span>(</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    axes,</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    [null_data, signal_data],</span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    [null_res, signal_res],</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    [<span class="st">"Null region (chr1 168–170 Mb)"</span>, <span class="st">"Signal region (FTO, chr16 53.8–55.8 Mb)"</span>]</span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>):</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Reload the merged SNP IDs to get positions</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    chrom, block_name <span class="op">=</span> (NULL_BLOCK <span class="cf">if</span> data <span class="kw">is</span> null_data <span class="cf">else</span> SIGNAL_BLOCK).split(<span class="st">"/"</span>, <span class="dv">1</span>)</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    gwas_path <span class="op">=</span> NULL_GWAS <span class="cf">if</span> data <span class="kw">is</span> null_data <span class="cf">else</span> SIGNAL_GWAS</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    gwas  <span class="op">=</span> pd.read_csv(gwas_path, sep<span class="op">=</span><span class="st">"</span><span class="ch">\t</span><span class="st">"</span>)</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    panel <span class="op">=</span> pd.read_csv(LD_PANEL <span class="op">/</span> chrom <span class="op">/</span> <span class="ss">f"</span><span class="sc">{</span>block_name<span class="sc">}</span><span class="ss">.tsv"</span>, sep<span class="op">=</span><span class="st">"</span><span class="ch">\t</span><span class="st">"</span>)</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    gwas[<span class="st">"snp_bare"</span>]  <span class="op">=</span> gwas[<span class="st">"SNP"</span>].<span class="bu">str</span>.lstrip(<span class="st">"chr"</span>)</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    panel[<span class="st">"snp_bare"</span>] <span class="op">=</span> panel[<span class="st">"SNP"</span>].<span class="bu">str</span>.lstrip(<span class="st">"chr"</span>)</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    merged <span class="op">=</span> gwas.merge(panel.reset_index().rename(columns<span class="op">=</span>{<span class="st">"index"</span>: <span class="st">"ld_row"</span>}),</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>                        on<span class="op">=</span><span class="st">"snp_bare"</span>, how<span class="op">=</span><span class="st">"inner"</span>)</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    bp <span class="op">=</span> merged[<span class="st">"BP_x"</span>].values</span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    z_full   <span class="op">=</span> data[<span class="st">"z_full"</span>]</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    mask_idx <span class="op">=</span> res[<span class="st">"mask_idx"</span>]</span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    obs_mask <span class="op">=</span> np.ones(<span class="bu">len</span>(z_full), dtype<span class="op">=</span><span class="bu">bool</span>)</span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    obs_mask[mask_idx] <span class="op">=</span> <span class="va">False</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Observed (non-masked)</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    ax.scatter(bp[obs_mask], z_full[obs_mask], s<span class="op">=</span><span class="dv">4</span>, color<span class="op">=</span><span class="st">"grey"</span>,</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>               alpha<span class="op">=</span><span class="fl">0.5</span>, label<span class="op">=</span><span class="st">"Observed"</span>)</span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Masked truth</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    ax.scatter(bp[mask_idx], z_full[mask_idx], s<span class="op">=</span><span class="dv">8</span>, color<span class="op">=</span><span class="st">"orange"</span>,</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>               alpha<span class="op">=</span><span class="fl">0.7</span>, label<span class="op">=</span><span class="st">"Masked (truth)"</span>, zorder<span class="op">=</span><span class="dv">3</span>)</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Imputed</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    ax.scatter(bp[mask_idx], res[<span class="st">"imputed"</span>], s<span class="op">=</span><span class="dv">8</span>, color<span class="op">=</span><span class="st">"steelblue"</span>,</span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>               alpha<span class="op">=</span><span class="fl">0.7</span>, label<span class="op">=</span><span class="st">"Imputed"</span>, zorder<span class="op">=</span><span class="dv">4</span>, marker<span class="op">=</span><span class="st">"^"</span>)</span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    ax.axhline(<span class="dv">0</span>, color<span class="op">=</span><span class="st">"black"</span>, linewidth<span class="op">=</span><span class="fl">0.5</span>)</span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    ax.set_xlabel(<span class="st">"Genomic position (bp)"</span>)</span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    ax.set_ylabel(<span class="st">"Z-score"</span>)</span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    ax.set_title(title, fontsize<span class="op">=</span><span class="dv">10</span>)</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>    ax.legend(fontsize<span class="op">=</span><span class="dv">8</span>, markerscale<span class="op">=</span><span class="fl">1.5</span>)</span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>fig.tight_layout()</span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>plt.show()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output cell-output-display">
+<div id="fig-manhattan" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-manhattan-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="imputation_benchmark_files/figure-html/fig-manhattan-output-1.png" width="1142" height="758" class="figure-img">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-manhattan-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;2: Z-score profile across the LD block. Grey = observed; orange = imputed (masked) truth; blue = imputed values.
+</figcaption>
+</figure>
+</div>
+</div>
+</div>
+</section>
+<section id="distribution-of-errors" class="level2">
+<h2 class="anchored" data-anchor-id="distribution-of-errors">Distribution of errors</h2>
+<div id="cell-fig-errors" class="cell" data-execution_count="7">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb7"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>fig, axes <span class="op">=</span> plt.subplots(<span class="dv">1</span>, <span class="dv">2</span>, figsize<span class="op">=</span>(<span class="dv">11</span>, <span class="dv">4</span>))</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> ax, res, title <span class="kw">in</span> <span class="bu">zip</span>(</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    axes,</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    [null_res, signal_res],</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    [<span class="st">"Null region"</span>, <span class="st">"Signal region (FTO)"</span>]</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>):</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    err <span class="op">=</span> res[<span class="st">"imputed"</span>] <span class="op">-</span> res[<span class="st">"truth"</span>]</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    ax.hist(err, bins<span class="op">=</span><span class="dv">50</span>, color<span class="op">=</span><span class="st">"steelblue"</span>, edgecolor<span class="op">=</span><span class="st">"white"</span>, linewidth<span class="op">=</span><span class="fl">0.3</span>)</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    ax.axvline(<span class="dv">0</span>, color<span class="op">=</span><span class="st">"tomato"</span>, linewidth<span class="op">=</span><span class="fl">1.5</span>, linestyle<span class="op">=</span><span class="st">"--"</span>)</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    ax.axvline(err.mean(), color<span class="op">=</span><span class="st">"orange"</span>, linewidth<span class="op">=</span><span class="fl">1.2</span>,</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>               label<span class="op">=</span><span class="ss">f"Mean error = </span><span class="sc">{</span>err<span class="sc">.</span>mean()<span class="sc">:.3f}</span><span class="ss">"</span>)</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    ax.set_xlabel(<span class="st">"Imputed − True z-score"</span>)</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    ax.set_ylabel(<span class="st">"Count"</span>)</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    ax.set_title(title)</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    ax.legend(fontsize<span class="op">=</span><span class="dv">8</span>)</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    ax.text(<span class="fl">0.97</span>, <span class="fl">0.93</span>, <span class="ss">f"SD = </span><span class="sc">{</span>err<span class="sc">.</span>std()<span class="sc">:.3f}</span><span class="ss">"</span>,</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>            transform<span class="op">=</span>ax.transAxes, ha<span class="op">=</span><span class="st">"right"</span>, fontsize<span class="op">=</span><span class="dv">9</span>,</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>            bbox<span class="op">=</span><span class="bu">dict</span>(boxstyle<span class="op">=</span><span class="st">"round"</span>, facecolor<span class="op">=</span><span class="st">"wheat"</span>, alpha<span class="op">=</span><span class="fl">0.5</span>))</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>fig.tight_layout()</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>plt.show()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output cell-output-display">
+<div id="fig-errors" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-errors-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="imputation_benchmark_files/figure-html/fig-errors-output-1.png" width="1046" height="374" class="figure-img">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-errors-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;3: Distribution of imputation error (imputed − true) for each region.
+</figcaption>
+</figure>
+</div>
+</div>
+</div>
+</section>
+<section id="sec-sensitivity" class="level2">
+<h2 class="anchored" data-anchor-id="sec-sensitivity">Correlation as a function of mask fraction</h2>
+<p>How does imputation quality degrade as more values are masked?</p>
+<div id="cell-fig-sensitivity" class="cell" data-execution_count="8">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>fracs <span class="op">=</span> [<span class="fl">0.10</span>, <span class="fl">0.20</span>, <span class="fl">0.30</span>, <span class="fl">0.40</span>, <span class="fl">0.50</span>, <span class="fl">0.60</span>, <span class="fl">0.70</span>, <span class="fl">0.80</span>]</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>results_sens <span class="op">=</span> {<span class="st">"Null"</span>: [], <span class="st">"Signal (FTO)"</span>: []}</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> frac <span class="kw">in</span> fracs:</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> label, data <span class="kw">in</span> [(<span class="st">"Null"</span>, null_data), (<span class="st">"Signal (FTO)"</span>, signal_data)]:</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        r <span class="op">=</span> run_benchmark(data, mask_frac<span class="op">=</span>frac)</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        results_sens[label].append(r[<span class="st">"corr"</span>] <span class="cf">if</span> r <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span> <span class="cf">else</span> <span class="bu">float</span>(<span class="st">"nan"</span>))</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>fig, ax <span class="op">=</span> plt.subplots(figsize<span class="op">=</span>(<span class="dv">7</span>, <span class="dv">4</span>))</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> label, corrs <span class="kw">in</span> results_sens.items():</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    ax.plot([f <span class="op">*</span> <span class="dv">100</span> <span class="cf">for</span> f <span class="kw">in</span> fracs], corrs, marker<span class="op">=</span><span class="st">"o"</span>, label<span class="op">=</span>label)</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>ax.axvline(MASK_FRAC <span class="op">*</span> <span class="dv">100</span>, color<span class="op">=</span><span class="st">"grey"</span>, linewidth<span class="op">=</span><span class="dv">1</span>, linestyle<span class="op">=</span><span class="st">":"</span>, label<span class="op">=</span><span class="ss">f"Benchmark (</span><span class="sc">{</span><span class="bu">int</span>(MASK_FRAC<span class="op">*</span><span class="dv">100</span>)<span class="sc">}</span><span class="ss">%)"</span>)</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>ax.set_xlabel(<span class="st">"Mask fraction (%)"</span>)</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>ax.set_ylabel(<span class="st">"Pearson r (imputed vs true)"</span>)</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>ax.set_title(<span class="st">"Imputation quality vs. mask fraction"</span>)</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>ax.legend()</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>ax.set_ylim(<span class="dv">0</span>, <span class="dv">1</span>)</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>fig.tight_layout()</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>plt.show()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div class="cell-output cell-output-display">
+<div id="fig-sensitivity" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-sensitivity-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="imputation_benchmark_files/figure-html/fig-sensitivity-output-1.png" width="662" height="374" class="figure-img">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-sensitivity-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;4: Pearson r between imputed and true z-scores across different mask fractions.
+</figcaption>
+</figure>
+</div>
+</div>
+</div>
+</section>
+<section id="summary" class="level2">
+<h2 class="anchored" data-anchor-id="summary">Summary</h2>
+<div id="cell-summary-table" class="cell" data-execution_count="9">
+<details class="code-fold">
+<summary>Code</summary>
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb9"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>metrics</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</details>
+<div id="summary-table" class="cell-output cell-output-display" data-execution_count="9">
+<div>
+
+
+<table class="dataframe caption-top table table-sm table-striped small" data-border="1">
+<thead>
+<tr class="header">
+<th data-quarto-table-cell-role="th"></th>
+<th data-quarto-table-cell-role="th">Region</th>
+<th data-quarto-table-cell-role="th">N masked</th>
+<th data-quarto-table-cell-role="th">LD components</th>
+<th data-quarto-table-cell-role="th">Pearson r</th>
+<th data-quarto-table-cell-role="th">R²</th>
+<th data-quarto-table-cell-role="th">RMSE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<th data-quarto-table-cell-role="th">0</th>
+<td>Null (chr1)</td>
+<td>1635</td>
+<td>170</td>
+<td>0.968</td>
+<td>0.937</td>
+<td>0.370</td>
+</tr>
+<tr class="even">
+<th data-quarto-table-cell-role="th">1</th>
+<td>Signal (FTO)</td>
+<td>2145</td>
+<td>430</td>
+<td>0.976</td>
+<td>0.952</td>
+<td>0.432</td>
+</tr>
+</tbody>
+</table>
+
+</div>
+</div>
+</div>
+<p><strong>Interpretation:</strong></p>
+<ul>
+<li><p>In the <strong>null region</strong> (no true signal), imputation recovers z-scores with modest correlation. The elastic-net model captures the LD structure well enough to reproduce the background noise pattern, though RMSE is non-trivial because z-scores are small.</p></li>
+<li><p>In the <strong>signal region</strong> (FTO locus), imputation is substantially better: the large z-scores at the association peak are reproduced faithfully because nearby LD proxies carry almost the same information. This is exactly the setting where imputation is most valuable for pleiodb — a dense association signal that was not tested in a sparse array-based study.</p></li>
+<li><p>Correlation degrades gracefully as the mask fraction increases (see <a href="#sec-sensitivity" class="quarto-xref">Section&nbsp;7</a>), but remains useful even at 60–70% masking in the signal region.</p></li>
+</ul>
+</section>
+
+</main>
+<!-- /main column -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+
+
+
+
+</body></html>

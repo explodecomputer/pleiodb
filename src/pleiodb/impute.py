@@ -213,14 +213,19 @@ def build_block_index(
     variants: np.ndarray,
     ld_dir: Path,
     ancestry: str = "EUR",
-) -> dict[Path, dict]:
+) -> dict[str, dict]:
     """Map pleiodb variants to LD reference panel blocks.
 
-    Scans *ld_dir / ancestry / {chr} / {start}-{end}/* once and matches
-    variant ALIDs to the SNP column of each block's ``.tsv`` file.
+    Supports two LD panel layouts:
 
-    Returns a dict keyed by block directory Path:
-    ``{'variant_indices': list[int], 'ld_row_indices': list[int], 'n_ld_snps': int}``
+    * **Flat** (production): ``ld_dir/ancestry/{chr}/{block}.tsv`` and
+      ``{block}.unphased.vcor1.gz`` as siblings in the chromosome directory.
+    * **Nested** (test fixtures): ``ld_dir/ancestry/{chr}/{block}/{block}.tsv``
+      and ``{block}.unphased.vcor1.gz`` inside a per-block subdirectory.
+
+    Returns a dict keyed by ``"{chrom}/{block_name}"`` string:
+    ``{'ld_path': Path, 'variant_indices': list[int], 'ld_row_indices': list[int],
+    'n_ld_snps': int}``
 
     Only blocks with ≥2 matched variants are included.
     """
@@ -236,22 +241,36 @@ def build_block_index(
         str(variants["id"][i]): i for i in range(len(variants))
     }
 
-    index: dict[Path, dict] = {}
+    index: dict[str, dict] = {}
 
     for chrom_dir in sorted(panel_dir.iterdir()):
         if not chrom_dir.is_dir():
             continue
-        chrom = chrom_dir.name  # e.g. "1", "22", "X"
+        chrom = chrom_dir.name
 
-        for block_dir in sorted(chrom_dir.iterdir()):
-            if not block_dir.is_dir():
+        # Collect (block_name, tsv_path, ld_path) pairs from both layouts.
+        # Use a dict so that if both layouts produce the same block_name, the
+        # flat layout takes precedence (it's the production layout).
+        blocks: dict[str, tuple[Path, Path]] = {}
+
+        # Nested layout: block subdirectories
+        for item in chrom_dir.iterdir():
+            if not item.is_dir():
                 continue
+            block_name = item.name
+            tsv_p = item / f"{block_name}.tsv"
+            ld_p = item / f"{block_name}.unphased.vcor1.gz"
+            if tsv_p.exists() and ld_p.exists():
+                blocks[block_name] = (tsv_p, ld_p)
 
-            tsv_path = block_dir / f"{block_dir.name}.tsv"
-            if not tsv_path.exists():
-                log.warning("Missing block TSV: %s – skipping", tsv_path)
-                continue
+        # Flat layout: TSV files directly in chrom_dir (overrides nested)
+        for tsv_p in chrom_dir.glob("*.tsv"):
+            block_name = tsv_p.stem
+            ld_p = chrom_dir / f"{block_name}.unphased.vcor1.gz"
+            if ld_p.exists():
+                blocks[block_name] = (tsv_p, ld_p)
 
+        for block_name, (tsv_path, ld_path) in sorted(blocks.items()):
             try:
                 tsv = pd.read_csv(tsv_path, sep="\t", usecols=["SNP"])
             except Exception as exc:  # noqa: BLE001
@@ -263,15 +282,16 @@ def build_block_index(
             ld_row_indices: list[int] = []
 
             for row_i, snp_id in enumerate(snp_ids):
-                # LD panel uses bare chromosome number; ALID may have "chr" prefix –
-                # normalise by stripping it from both sides before comparison.
+                # LD panel SNP IDs may have a "chr" prefix; strip for comparison.
                 bare_snp = snp_id.lstrip("chr") if snp_id.startswith("chr") else snp_id
                 if bare_snp in alid_to_idx:
                     variant_indices.append(alid_to_idx[bare_snp])
                     ld_row_indices.append(row_i)
 
             if len(variant_indices) >= 2:
-                index[block_dir] = {
+                key = f"{chrom}/{block_name}"
+                index[key] = {
+                    "ld_path": ld_path,
                     "variant_indices": variant_indices,
                     "ld_row_indices": ld_row_indices,
                     "n_ld_snps": len(snp_ids),
@@ -285,16 +305,14 @@ def build_block_index(
     return index
 
 
-def _load_ld_submatrix(block_dir: Path, ld_row_indices: list[int]) -> np.ndarray:
-    """Load the full LD matrix for *block_dir* and return the submatrix.
+def _load_ld_submatrix(ld_path: Path, ld_row_indices: list[int]) -> np.ndarray:
+    """Load the full LD matrix from *ld_path* and return the submatrix.
 
-    The submatrix rows and columns correspond to *ld_row_indices* in the
-    order given.
+    *ld_path* points directly to the ``.unphased.vcor1.gz`` file.
+    The submatrix rows and columns correspond to *ld_row_indices*.
     """
     import pandas as pd
 
-    block_name = block_dir.name
-    ld_path = block_dir / f"{block_name}.unphased.vcor1.gz"
     full = pd.read_csv(ld_path, header=None, delimiter="\t").values.astype(np.float64)
     idx = np.array(ld_row_indices)
     return full[np.ix_(idx, idx)]
@@ -341,9 +359,10 @@ def impute_z_block(
     blocks_skipped_size = 0
     blocks_skipped_cor = 0
 
-    for block_dir, info in block_index.items():
+    for block_key, info in block_index.items():
         vi = np.array(info["variant_indices"])   # pleiodb row indices
         li = info["ld_row_indices"]              # rows in LD matrix
+        ld_path = info["ld_path"]
 
         # EAF for this block's variants
         block_eaf = eaf_arr[vi]
@@ -351,20 +370,20 @@ def impute_z_block(
         if nan_eaf.any():
             log.warning(
                 "%s: %d variant(s) have NaN EAF; SE-outlier step skipped for them",
-                block_dir.name, nan_eaf.sum(),
+                block_key, nan_eaf.sum(),
             )
 
         try:
-            ld_sub = _load_ld_submatrix(block_dir, li)
+            ld_sub = _load_ld_submatrix(ld_path, li)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Could not load LD matrix for %s: %s – skipping", block_dir, exc)
+            log.warning("Could not load LD matrix for %s: %s – skipping", block_key, exc)
             blocks_skipped_size += 1
             continue
 
         try:
             eigenvalues, eigenvectors = _ld_pca(ld_sub, thresh)
         except Exception as exc:  # noqa: BLE001
-            log.debug("PCA failed for %s: %s – skipping", block_dir.name, exc)
+            log.debug("PCA failed for %s: %s – skipping", block_key, exc)
             blocks_skipped_size += 1
             continue
 
@@ -405,7 +424,7 @@ def impute_z_block(
             if not np.isfinite(corr) or corr < min_cor:
                 log.debug(
                     "%s trait-col %d: correlation %.3f < %.3f – skipping",
-                    block_dir.name, j, corr if np.isfinite(corr) else float("nan"), min_cor,
+                    block_key, j, corr if np.isfinite(corr) else float("nan"), min_cor,
                 )
                 blocks_skipped_cor += 1
                 continue
