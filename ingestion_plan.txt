@@ -1,0 +1,19 @@
+
+List of all studies in gpmap:
+
+/local-scratch/projects/genotype-phenotype-map/results/latest/studies_processed.tsv.gz
+
+Use only data_type="phenotype"
+
+Location of all VCF files with meta data in hg19:
+
+/local-scratch/data/opengwas/igd
+
+List of all variants to use:
+
+variants_hg38.tsv
+variants_hg19.txt
+
+
+
+I need all "phenotype" studies x all variants
