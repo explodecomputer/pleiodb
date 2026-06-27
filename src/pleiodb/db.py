@@ -39,11 +39,12 @@ _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
 _TRAITS_DT = np.dtype([("id", "U64"), ("name", "U256")])
 
 _VARIANTS_DT = np.dtype([
-    ("id",    "U64"),
-    ("chrom", "U10"),
-    ("pos",   np.uint32),
-    ("a1",    "U64"),
-    ("a2",    "U64"),
+    ("id",      "U64"),
+    ("chrom",   "U10"),
+    ("pos",     np.uint32),
+    ("a1",      "U64"),
+    ("a2",      "U64"),
+    ("id_hg38", "U64"),   # empty string when no liftover was stored
 ])
 
 
@@ -54,26 +55,32 @@ def _load_variants_tsv(
 
     Shared by the ``variants`` and ``eaf`` properties; both are populated in a
     single pass so the file is only read once.
+
+    Detects the optional ``alid_hg38`` column from the header; when present,
+    populates the ``id_hg38`` field of the returned array.  Missing column
+    leaves ``id_hg38`` as empty string for all rows.
     """
     rows = []
     eaf_list = []
+    has_hg38 = False
     with open(path) as fh:
-        header_seen = False
+        header: list[str] = []
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            if not header_seen:
-                # First non-blank line is the header
-                header_seen = True
+            if not header:
+                header = line.split("\t")
+                has_hg38 = "alid_hg38" in header
                 continue
-            parts = line.split("\t", 1)
+            parts = line.split("\t")
             alid = parts[0]
             raw_eaf = parts[1].strip() if len(parts) > 1 else ""
             eaf_val = float(raw_eaf) if raw_eaf else np.nan
+            alid_hg38 = parts[2].strip() if has_hg38 and len(parts) > 2 else ""
 
             chrom, pos, a1, a2 = parse_alid(alid)
-            rows.append((alid, chrom, pos, a1, a2))
+            rows.append((alid, chrom, pos, a1, a2, alid_hg38))
             eaf_list.append(eaf_val)
 
     variants = np.array(rows, dtype=_VARIANTS_DT)

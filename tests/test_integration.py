@@ -1175,3 +1175,144 @@ class TestImputation:
             n_imp = int(row["n_variants_imputed"])
             assert n_obs >= 0
             assert n_imp >= 0
+
+
+# ---------------------------------------------------------------------------
+# Test – hg19 variant liftover for LD imputation (issues 037–040)
+# ---------------------------------------------------------------------------
+
+class TestLiftoverImputation:
+    """Build with hg19 variants + hg38 LD panel; verify liftover fires correctly."""
+
+    # Two hg19 ALIDs from the test variant file (chromosome 10)
+    HG19_ALID_0 = "10:101248474_C_T"
+    HG19_ALID_1 = "10:125249764_C_T"
+    # Fake hg38 positions the mock will return
+    HG38_POS_0 = 100000000
+    HG38_POS_1 = 124000000
+
+    @staticmethod
+    def _make_hg38_ld_panel(tmp_path, alid_hg38_0: str, alid_hg38_1: str) -> Path:
+        """Create a tiny synthetic LD panel using *hg38* ALIDs."""
+        import gzip, io as _io
+        chrom = "10"
+        for alid in (alid_hg38_0, alid_hg38_1):
+            assert alid.startswith("10:"), f"expected chr10 ALID, got {alid}"
+        bps = [int(a.split(":")[1].split("_")[0]) for a in (alid_hg38_0, alid_hg38_1)]
+        start = min(bps) - 1000
+        end = max(bps) + 1000
+        block_name = f"{start}-{end}"
+
+        block_dir = tmp_path / chrom / block_name
+        block_dir.mkdir(parents=True)
+
+        tsv_lines = ["CHR\tSNP\tOA\tEA\tEAF\tBP"]
+        for alid, bp in zip((alid_hg38_0, alid_hg38_1), bps):
+            parts = alid.split("_")
+            a1, a2 = parts[1], parts[2]
+            tsv_lines.append(f"{chrom}\t{alid}\t{a2}\t{a1}\t0.3\t{bp}")
+        (block_dir / f"{block_name}.tsv").write_text("\n".join(tsv_lines) + "\n")
+
+        n = 2
+        ld = np.eye(n) + 0.5 * (np.ones((n, n)) - np.eye(n))
+        buf = _io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            for row in ld:
+                gz.write(("\t".join(f"{v:.6f}" for v in row) + "\n").encode())
+        (block_dir / f"{block_name}.unphased.vcor1.gz").write_bytes(buf.getvalue())
+
+        return tmp_path  # callers use ld_ancestry="" so tmp_path is the chrom parent
+
+    def _build_with_liftover(self, tmp_path):
+        """Build with mocked pyliftover that maps hg19 → known hg38 positions."""
+        from unittest.mock import MagicMock, patch
+        from pleiodb.build import build_database
+
+        alid_hg38_0 = f"10:{self.HG38_POS_0}_C_T"
+        alid_hg38_1 = f"10:{self.HG38_POS_1}_C_T"
+
+        ld_dir = tmp_path / "ld_panel"
+        ld_dir.mkdir()
+        panel_root = self._make_hg38_ld_panel(ld_dir, alid_hg38_0, alid_hg38_1)
+
+        # Mock LiftOver so our two test variants map to the hg38 positions we built
+        hg19_pos_0 = int(self.HG19_ALID_0.split(":")[1].split("_")[0])
+        hg19_pos_1 = int(self.HG19_ALID_1.split(":")[1].split("_")[0])
+        result_map = {
+            ("chr10", hg19_pos_0 - 1): [("chr10", self.HG38_POS_0 - 1, "+", 0)],
+            ("chr10", hg19_pos_1 - 1): [("chr10", self.HG38_POS_1 - 1, "+", 0)],
+        }
+        lo_mock = MagicMock()
+        lo_mock.convert_coordinate.side_effect = lambda c, p: result_map.get((c, p), [])
+
+        db_path = tmp_path / "test_lift.pleiodb"
+        with patch("pyliftover.LiftOver", return_value=lo_mock):
+            build_database(
+                output_dir=db_path,
+                variants_path=VARIANTS_HG19,
+                trait_tsv=TRAITS_TSV,
+                chunk_shape=(64, 8),
+                workers=2,
+                variants_build="hg19",
+                ld_dir=panel_root,
+                ld_ancestry="",
+                ld_min_cor=0.0,
+            )
+        return db_path
+
+    def test_alid_hg38_column_written(self, tmp_path):
+        """variants.tsv must contain alid_hg38 column after liftover build."""
+        db_path = self._build_with_liftover(tmp_path)
+        with open(db_path / "variants.tsv") as f:
+            header = f.readline().strip().split("\t")
+        assert "alid_hg38" in header, f"alid_hg38 not in header: {header}"
+
+    def test_meta_json_flag(self, tmp_path):
+        """meta.json must have variants_hg38_stored=true after liftover build."""
+        import json
+        db_path = self._build_with_liftover(tmp_path)
+        meta = json.loads((db_path / "meta.json").read_text())
+        assert meta.get("variants_hg38_stored") is True
+
+    def test_id_hg38_readable_from_db(self, tmp_path):
+        """db.variants['id_hg38'] must be non-empty for lifted variants."""
+        from pleiodb.db import GWASDatabase
+        db_path = self._build_with_liftover(tmp_path)
+        db = GWASDatabase.open(db_path)
+        id_hg38 = db.variants["id_hg38"]
+        # At least our two target variants should have been lifted
+        non_empty = (id_hg38 != "").sum()
+        assert non_empty >= 2, f"Expected ≥2 hg38 ALIDs, got {non_empty}"
+
+    def test_backwards_compat_no_hg38_column(self, tmp_path):
+        """Opening a DB built without liftover returns empty id_hg38 strings."""
+        from pleiodb.build import build_database
+        from pleiodb.db import GWASDatabase
+        db_path = tmp_path / "no_lift.pleiodb"
+        build_database(
+            output_dir=db_path,
+            variants_path=VARIANTS_HG38,
+            trait_tsv=TRAITS_TSV,
+            chunk_shape=(64, 8),
+            workers=2,
+            variants_build="hg38",
+        )
+        db = GWASDatabase.open(db_path)
+        id_hg38 = db.variants["id_hg38"]
+        assert all(v == "" for v in id_hg38), "Expected all empty id_hg38 for non-lifted DB"
+
+    def test_meta_json_flag_false_without_liftover(self, tmp_path):
+        """meta.json must have variants_hg38_stored=false when no liftover performed."""
+        import json
+        from pleiodb.build import build_database
+        db_path = tmp_path / "no_lift2.pleiodb"
+        build_database(
+            output_dir=db_path,
+            variants_path=VARIANTS_HG38,
+            trait_tsv=TRAITS_TSV,
+            chunk_shape=(64, 8),
+            workers=2,
+            variants_build="hg38",
+        )
+        meta = json.loads((db_path / "meta.json").read_text())
+        assert meta.get("variants_hg38_stored") is False

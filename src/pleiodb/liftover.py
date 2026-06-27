@@ -106,3 +106,71 @@ def make_lifted_lookup(
         )
 
     return lookup
+
+
+def lift_variants(
+    variants: np.ndarray,
+    from_build: str,
+    to_build: str,
+) -> np.ndarray:
+    """Return a copy of *variants* with coordinates lifted from *from_build* to *to_build*.
+
+    Variants that fail liftover retain their original field values — they will be
+    excluded from LD block matching but do not cause errors.
+
+    Parameters
+    ----------
+    variants  : structured array with fields (id, chrom, pos, a1, a2)
+    from_build : source genome build (hg19 / hg38 / aliases)
+    to_build   : target genome build
+
+    Returns
+    -------
+    New structured array of identical length and dtype with updated id, chrom, pos
+    for successfully lifted variants.
+    """
+    try:
+        from pyliftover import LiftOver  # type: ignore
+    except ImportError:
+        raise ImportError(
+            "pyliftover is required for variant liftover: pip install pyliftover"
+        )
+
+    from_build = normalise_build(from_build)
+    to_build = normalise_build(to_build)
+
+    log.info(
+        "Lifting variant array: %d variants %s → %s", len(variants), from_build, to_build
+    )
+    lo = LiftOver(from_build, to_build)
+
+    out = variants.copy()
+    n_fail = 0
+
+    for i, row in enumerate(variants):
+        chrom = str(row["chrom"])
+        pos = int(row["pos"])
+        a1 = str(row["a1"])
+        a2 = str(row["a2"])
+
+        chrom_in = chrom if chrom.startswith("chr") else f"chr{chrom}"
+        result = lo.convert_coordinate(chrom_in, pos - 1)
+
+        if not result:
+            n_fail += 1
+            continue
+
+        new_chrom_full: str = result[0][0]
+        new_pos = int(result[0][1]) + 1
+        new_chrom_bare = new_chrom_full.lstrip("chr")
+
+        out["id"][i] = f"{new_chrom_bare}:{new_pos}_{a1}_{a2}"
+        out["chrom"][i] = new_chrom_bare
+        out["pos"][i] = new_pos
+
+    n_ok = len(variants) - n_fail
+    log.info(
+        "Liftover %s→%s complete: %d/%d variants lifted; %d kept original (failed)",
+        from_build, to_build, n_ok, len(variants), n_fail,
+    )
+    return out

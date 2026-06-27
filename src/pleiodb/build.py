@@ -43,7 +43,7 @@ from .alid import canonical_alid, compress_allele, parse_alid
 from .quantize import encode_z, encode_neff, encode_eaf, Z_NA
 from .store import ChunkedMatrix
 from .vcf import read_vcf
-from .liftover import builds_differ, make_lifted_lookup, normalise_build
+from .liftover import builds_differ, lift_variants, make_lifted_lookup, normalise_build
 
 log = logging.getLogger(__name__)
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
@@ -362,25 +362,32 @@ def _write_variants_tsv(
     path: Path,
     variants: np.ndarray,
     eaf: np.ndarray,
+    variants_hg38: np.ndarray | None = None,
 ) -> None:
     """Write ``variants.tsv`` — the per-variant metadata file inside .pleiodb.
 
     Format (tab-separated, header row)::
 
-        alid    eaf
-        1:100_A_T   0.35
+        alid    eaf    [alid_hg38]
+        1:100_A_T   0.35   1:200_A_T
         ...
 
     Row order matches the V-axis of all binary matrices.  ``eaf`` values that
-    are NaN are written as empty strings.
+    are NaN are written as empty strings.  The optional ``alid_hg38`` column is
+    written only when *variants_hg38* is provided (i.e. a liftover was performed).
     """
     with open(path, "w") as fh:
-        fh.write("alid\teaf\n")
+        header = "alid\teaf\talid_hg38\n" if variants_hg38 is not None else "alid\teaf\n"
+        fh.write(header)
         for i in range(len(variants)):
             alid = str(variants["id"][i])
             e = float(eaf[i])
             eaf_str = f"{e:.6g}" if np.isfinite(e) else ""
-            fh.write(f"{alid}\t{eaf_str}\n")
+            if variants_hg38 is not None:
+                alid_hg38 = str(variants_hg38["id"][i])
+                fh.write(f"{alid}\t{eaf_str}\t{alid_hg38}\n")
+            else:
+                fh.write(f"{alid}\t{eaf_str}\n")
 
 
 def _build_pos_lookup(
@@ -483,6 +490,15 @@ def build_database(
         V, T, chunk_shape, canon_build or "unspecified",
     )
 
+    # --- Lift variant list to hg38 for LD panel matching (when needed) ------
+    # The LD panel is always in hg38; when variants are in another build we
+    # lift a copy of the array to hg38 so build_block_index can match ALIDs.
+    # The original coordinates are preserved for VCF reading and stored as the
+    # primary 'alid' column; the lifted coordinates are stored as 'alid_hg38'.
+    variants_hg38: np.ndarray | None = None
+    if ld_dir is not None and canon_build is not None and canon_build != "hg38":
+        variants_hg38 = lift_variants(variants, canon_build, "hg38")
+
     # --- Build pos_lookup and regions file for same-build traits ------------
     direct_pos_lookup = _build_pos_lookup(variants)
     direct_regions_file = _make_regions_file(direct_pos_lookup)
@@ -507,7 +523,7 @@ def build_database(
         return _lifted_cache[vcf_build_norm], _lifted_regions_cache[vcf_build_norm]
 
     # ---- Write variant metadata (TSV replaces variants.npy + eaf.f16) ------
-    _write_variants_tsv(out / "variants.tsv", variants, eaf)
+    _write_variants_tsv(out / "variants.tsv", variants, eaf, variants_hg38)
 
     # ---- Initialise chunked matrices ---------------------------------------
     zscore_mat = ChunkedMatrix(out / "zscore", (V, T), np.int16, chunk_shape)
@@ -525,13 +541,9 @@ def build_database(
     block_index: dict = {}
     if ld_dir is not None:
         from .impute import build_block_index
-        if canon_build not in ("hg38", "GRCh38") and canon_build is not None:
-            log.warning(
-                "--ld-dir supplied but --variants-build is %s (not hg38); "
-                "LD panel is in hg38 coordinates – variant matching may be incorrect",
-                canon_build,
-            )
-        block_index = build_block_index(variants, Path(ld_dir), ld_ancestry)
+        # Use hg38-lifted variant array when available; otherwise use original.
+        _variants_for_ld = variants_hg38 if variants_hg38 is not None else variants
+        block_index = build_block_index(_variants_for_ld, Path(ld_dir), ld_ancestry)
 
     # Running COO lists for the imputed-positions mask
     imputed_coo_v: list[np.ndarray] = []
@@ -663,6 +675,7 @@ def build_database(
         "neff_encoding": "log2_u16_frac11",
         "format_version": 3,
         "variants_build": canon_build,
+        "variants_hg38_stored": variants_hg38 is not None,
         "var_y": var_y_list,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
