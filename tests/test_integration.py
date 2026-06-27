@@ -1176,6 +1176,144 @@ class TestImputation:
             assert n_obs >= 0
             assert n_imp >= 0
 
+    @staticmethod
+    def _make_dense_chr10_ld_panel(tmp_path: Path, full_vcf: str) -> Path:
+        """Build a synthetic LD block containing ALL chr10 variants from *full_vcf*.
+
+        This gives the elastic net enough training variants (48 total, minus 1
+        stripped from the partial VCF = 47 observed) to impute the missing cell.
+        The block TSV uses the same hg19 positions as the VCF so that
+        read_vcf_region (called without vcf_build, i.e. no liftover) finds data.
+        """
+        import gzip as _gzip, io as _io
+
+        # Extract all chr10 variants from the VCF
+        result = subprocess.run(
+            ["bcftools", "view", "-r", "10", "-Ov", full_vcf],
+            capture_output=True, text=True, check=True,
+        )
+        block_vars: list[tuple[str, int, str, str]] = []
+        for line in result.stdout.splitlines():
+            if line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            chrom, pos, ref, alt = parts[0].lstrip("chr"), int(parts[1]), parts[3], parts[4]
+            # Canonical ALID (A1 ≤ A2)
+            a1, a2 = (ref, alt) if ref <= alt else (alt, ref)
+            block_vars.append((f"10:{pos}_{a1}_{a2}", pos, a1, a2))
+
+        block_vars.sort(key=lambda x: x[1])
+        bps = [v[1] for v in block_vars]
+        start = min(bps) - 1000
+        end   = max(bps) + 1000
+        block_name = f"{start}-{end}"
+
+        block_dir = tmp_path / "10" / block_name
+        block_dir.mkdir(parents=True)
+
+        tsv_lines = ["CHR\tSNP\tOA\tEA\tEAF\tBP"]
+        for alid, bp, a1, a2 in block_vars:
+            tsv_lines.append(f"10\t{alid}\t{a2}\t{a1}\t0.3\t{bp}")
+        (block_dir / f"{block_name}.tsv").write_text("\n".join(tsv_lines) + "\n")
+
+        n = len(block_vars)
+        # AR(1) LD: ld[i,j] = rho^|i-j|.  Gives decaying local correlation so
+        # the elastic net can actually predict a missing value from its neighbours
+        # (constant off-diagonal collapses to all-uniform eigenvectors and the
+        # elastic net over-regularises to zero).
+        rho = 0.85
+        idx = np.arange(n)
+        ld = rho ** np.abs(idx[:, None] - idx[None, :])
+        buf = _io.BytesIO()
+        with _gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            for row in ld:
+                gz.write(("\t".join(f"{v:.6f}" for v in row) + "\n").encode())
+        (block_dir / f"{block_name}.unphased.vcor1.gz").write_bytes(buf.getvalue())
+
+        return tmp_path  # callers use ld_ancestry="" so tmp_path is the chrom-parent
+
+    def test_imputation_actually_fills_missing_cells(self, tmp_path):
+        """Imputation fills a cell genuinely missing from the source VCF.
+
+        The LD block contains ALL 48 chr10 variants from the test VCF.  One
+        trait is built from a VCF that has been stripped of one block variant
+        (POS=125587975).  Dense mode reads the VCF region, gets 47 observed
+        z-scores, trains the elastic net on them, and imputes the 1 missing
+        stored position.
+
+        No 'build' column in traits TSV → vcf_build=None → no liftover, so
+        the hg19 block coordinates match the hg19 VCF directly.
+        """
+        import csv as csv_mod, zstandard
+        from pleiodb.build import build_database
+        from pleiodb.db import GWASDatabase
+        from pleiodb.quantize import decode_z
+
+        FULL_VCF    = str(TEST_DATA / "vcf" / "ieu-a-7.vcf.gz")
+        MISSING_POS = 125587975   # 10:125587975_A_T – in variants_hg19.tsv + full VCF
+
+        # Create partial VCF missing one stored variant
+        partial_vcf = tmp_path / "partial_ieu-a-7.vcf.gz"
+        subprocess.run(
+            ["bcftools", "view", "-e", f"POS={MISSING_POS}",
+             "-Oz", "-o", str(partial_vcf), FULL_VCF],
+            check=True,
+        )
+        subprocess.run(["bcftools", "index", str(partial_vcf)], check=True)
+
+        # No 'build' column → vcf_build=None → read_vcf_region skips liftover
+        traits_tsv = tmp_path / "traits.tsv"
+        traits_tsv.write_text(
+            "trait_id\ttrait_name\tN\tvcf_path\n"
+            f"full\tFull coverage\t100000\t{FULL_VCF}\n"
+            f"partial\tMissing one block SNP\t100000\t{partial_vcf}\n"
+        )
+
+        ld_dir = tmp_path / "ld_panel"
+        ld_dir.mkdir()
+        panel_root = self._make_dense_chr10_ld_panel(ld_dir, FULL_VCF)
+
+        db_path = tmp_path / "test.pleiodb"
+        build_database(
+            output_dir=db_path,
+            variants_path=VARIANTS_HG19,
+            trait_tsv=str(traits_tsv),
+            chunk_shape=(64, 8),
+            workers=2,
+            ld_dir=panel_root,
+            ld_ancestry="",
+            ld_min_cor=0.0,
+        )
+
+        # imputed.coo.zst must have at least one entry
+        blob = zstandard.ZstdDecompressor().decompress(
+            (db_path / "imputed.coo.zst").read_bytes()
+        )
+        pairs = np.frombuffer(blob, dtype=np.uint32).reshape(-1, 2)
+        assert len(pairs) >= 1, "expected at least one imputed cell"
+
+        # The imputed cell must belong to trait 1 (index 1, the partial VCF)
+        assert 1 in pairs[:, 1], "imputed cell should be in the partial-VCF trait (index 1)"
+
+        # That position must now be finite in the z-score matrix
+        db = GWASDatabase.open(db_path)
+        V, T = db.V, db.T
+        z = decode_z(db._zscore.get_block(0, V, 0, T))
+
+        imputed_variant_rows = pairs[pairs[:, 1] == 1, 0]
+        assert len(imputed_variant_rows) >= 1
+        for v_idx in imputed_variant_rows:
+            assert np.isfinite(z[v_idx, 1]), (
+                f"imputed position v={v_idx} should be finite in z-score matrix"
+            )
+
+        # traits.tsv must record imputed count ≥ 1 for the partial-VCF trait
+        with open(db_path / "traits.tsv") as f:
+            rows = {r["trait_id"]: r for r in csv_mod.DictReader(f, delimiter="\t")}
+        assert int(rows["partial"]["n_variants_imputed"]) >= 1, (
+            "traits.tsv must record imputed count for the partial-VCF trait"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Test – hg19 variant liftover for LD imputation (issues 037–040)
