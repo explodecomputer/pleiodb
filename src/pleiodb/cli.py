@@ -78,8 +78,20 @@ def main():
          "When set, VCF files whose traits TSV specifies a different build "
          "will have their coordinates lifted over automatically.",
 )
+@click.option(
+    "--ld-dir", default=None,
+    help="LD reference panel directory (e.g. …/ld_reference_panel_hg38/EUR). "
+         "When provided, missing z-scores are imputed via elastic-net on LD "
+         "eigenvectors. Requires --variants-build hg38.",
+)
+@click.option("--ld-ancestry", default="EUR", show_default=True,
+              help="[impute] Ancestry subdirectory within --ld-dir.")
+@click.option("--ld-thresh", default=0.9, show_default=True, type=float,
+              help="[impute] Fraction of LD variance retained in PCA.")
+@click.option("--ld-min-cor", default=0.7, show_default=True, type=float,
+              help="[impute] Min block-level correlation to accept imputed values.")
 def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwrite,
-          variants_build):
+          variants_build, ld_dir, ld_ancestry, ld_thresh, ld_min_cor):
     """Build a pleiodb database from GWAS-VCF files."""
     from .build import build_database
     thresholds = [float(p) for p in pval]
@@ -92,6 +104,10 @@ def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwri
         pval_thresholds=thresholds,
         overwrite=overwrite,
         variants_build=variants_build,
+        ld_dir=ld_dir,
+        ld_ancestry=ld_ancestry,
+        ld_thresh=ld_thresh,
+        ld_min_cor=ld_min_cor,
     )
     click.echo(f"Database written to {output_dir}")
 

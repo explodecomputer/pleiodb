@@ -316,6 +316,7 @@ def _write_traits_tsv(
     traits: list["TraitInfo"],
     var_y_arr: np.ndarray,
     n_variants_arr: np.ndarray,
+    n_imputed_arr: np.ndarray,
     n_variants_var_y_arr: np.ndarray,
     pval_thresholds: Sequence[float],
     n_sig_per_trait: dict[float, np.ndarray],
@@ -324,16 +325,18 @@ def _write_traits_tsv(
 
     Format (tab-separated, header row)::
 
-        trait_id  trait_name  N  K  neff_study  var_y  n_variants  n_variants_var_y
-            n_sig_5e-8  n_sig_1e-5  ...
+        trait_id  trait_name  N  K  neff_study  var_y  n_variants  n_variants_imputed
+            n_variants_var_y  n_sig_5e-8  n_sig_1e-5  ...
 
+    ``n_variants`` counts only *observed* (pre-imputation) z-scores.
+    ``n_variants_imputed`` counts cells filled by LD imputation (0 if disabled).
     Row order matches the T-axis of all binary matrices.  Empty string is used
     for ``K`` (continuous traits) and ``var_y`` when estimation failed.
     """
     sig_cols = [f"n_sig_{p:.0e}".replace("+", "") for p in pval_thresholds]
     header = (
         ["trait_id", "trait_name", "N", "K", "neff_study", "var_y",
-         "n_variants", "n_variants_var_y"]
+         "n_variants", "n_variants_imputed", "n_variants_var_y"]
         + sig_cols
     )
     with open(path, "w") as fh:
@@ -348,7 +351,8 @@ def _write_traits_tsv(
             row = (
                 [t.trait_id, t.trait_name, str(t.N), k_str,
                  f"{neff_study:.6g}", var_y_str,
-                 str(int(n_variants_arr[i])), str(int(n_variants_var_y_arr[i]))]
+                 str(int(n_variants_arr[i])), str(int(n_imputed_arr[i])),
+                 str(int(n_variants_var_y_arr[i]))]
                 + sig_vals
             )
             fh.write("\t".join(row) + "\n")
@@ -456,6 +460,10 @@ def build_database(
     pval_thresholds: Sequence[float] = DEFAULT_PVAL_THRESHOLDS,
     overwrite: bool = False,
     variants_build: str | None = None,
+    ld_dir: str | Path | None = None,
+    ld_ancestry: str = "EUR",
+    ld_thresh: float = 0.9,
+    ld_min_cor: float = 0.7,
 ) -> None:
     out = Path(output_dir)
     if out.exists() and not overwrite:
@@ -509,8 +517,25 @@ def build_database(
 
     var_y_arr = np.full(T, np.nan, dtype=np.float64)       # accumulated per-trait var_y
     neff_base = np.full(T, np.nan, dtype=np.float32)       # per-trait median Neff
-    n_variants_arr = np.zeros(T, dtype=np.int64)            # finite z-score counts
+    n_variants_arr = np.zeros(T, dtype=np.int64)            # finite z-score counts (observed)
+    n_imputed_arr = np.zeros(T, dtype=np.int64)             # imputed z-score counts
     n_variants_var_y_arr = np.zeros(T, dtype=np.int64)      # variants used for var_y
+
+    # ---- LD imputation setup -------------------------------------------------
+    block_index: dict = {}
+    if ld_dir is not None:
+        from .impute import build_block_index
+        if canon_build not in ("hg38", "GRCh38") and canon_build is not None:
+            log.warning(
+                "--ld-dir supplied but --variants-build is %s (not hg38); "
+                "LD panel is in hg38 coordinates – variant matching may be incorrect",
+                canon_build,
+            )
+        block_index = build_block_index(variants, Path(ld_dir), ld_ancestry)
+
+    # Running COO lists for the imputed-positions mask
+    imputed_coo_v: list[np.ndarray] = []
+    imputed_coo_t: list[np.ndarray] = []
 
     # ---- Main ingestion loop -----------------------------------------------
     for t_block_start in range(0, T, CT):
@@ -536,13 +561,30 @@ def build_database(
                 n_done += 1
                 log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
+        # ---- LD imputation (optional) ----------------------------------------
+        imputed_mask_block = np.zeros((V, B), dtype=bool)
+        if block_index:
+            from .impute import impute_z_block
+            impute_z_block(
+                z_block, variants, eaf, block_index,
+                thresh=ld_thresh, min_cor=ld_min_cor,
+                out_mask=imputed_mask_block,
+            )
+            hv, ht = np.where(imputed_mask_block)
+            if len(hv):
+                imputed_coo_v.append(hv.astype(np.uint32))
+                imputed_coo_t.append((ht + t_block_start).astype(np.uint32))
+
         # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
         for j, t in enumerate(batch_traits):
             global_t = t_block_start + j
             neff_study = compute_neff_study(t.N, t.K)
 
-            # Count matched variants (finite z-scores) for this trait
-            n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
+            # n_variants counts only *observed* (pre-imputation) z-scores
+            n_variants_arr[global_t] = int(
+                (np.isfinite(z_block[:, j]) & ~imputed_mask_block[:, j]).sum()
+            )
+            n_imputed_arr[global_t] = int(imputed_mask_block[:, j].sum())
 
             # Validate that the VCF contained usable SE values
             if not np.any(np.isfinite(se_block[:, j])):
@@ -580,6 +622,9 @@ def build_database(
     zscore_mat.close_write()
     neff_mat.close_write()
 
+    # ---- Imputed-positions mask --------------------------------------------
+    _write_imputed_coo(out, imputed_coo_v, imputed_coo_t)
+
     # ---- Significance masks ------------------------------------------------
     log.info("Building significance masks (%s)…", pval_thresholds)
     n_sig_per_trait = _build_masks(out, zscore_mat, V, T, pval_thresholds)
@@ -590,6 +635,7 @@ def build_database(
         trait_pairs,
         var_y_arr,
         n_variants_arr,
+        n_imputed_arr,
         n_variants_var_y_arr,
         pval_thresholds,
         n_sig_per_trait,
@@ -626,6 +672,30 @@ def build_database(
 # ---------------------------------------------------------------------------
 # Significance masks
 # ---------------------------------------------------------------------------
+
+def _write_imputed_coo(
+    out: Path,
+    coo_v: list[np.ndarray],
+    coo_t: list[np.ndarray],
+) -> None:
+    """Write ``imputed.coo.zst`` — sparse mask of LD-imputed (v, t) pairs.
+
+    Format matches the significance masks: zstd-compressed uint32 pairs
+    sorted lexicographically by (v_idx, t_idx).  An empty file is written
+    when there are no imputed cells so consumers can always probe its existence.
+    """
+    if coo_v:
+        v_all = np.concatenate(coo_v)
+        t_all = np.concatenate(coo_t)
+        order = np.lexsort((t_all, v_all))
+        pairs = np.column_stack([v_all[order], t_all[order]])
+    else:
+        pairs = np.empty((0, 2), dtype=np.uint32)
+
+    blob = _CCTX.compress(pairs.astype(np.uint32).tobytes())
+    (out / "imputed.coo.zst").write_bytes(blob)
+    log.info("Imputed mask: %d cells → imputed.coo.zst", len(pairs))
+
 
 def _build_masks(
     out: Path,
