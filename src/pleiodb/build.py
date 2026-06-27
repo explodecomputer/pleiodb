@@ -338,6 +338,7 @@ def _write_traits_tsv(
         ["trait_id", "trait_name", "N", "K", "neff_study", "var_y",
          "n_variants", "n_variants_imputed", "n_variants_var_y"]
         + sig_cols
+        + ["vcf_path", "vcf_build"]
     )
     with open(path, "w") as fh:
         fh.write("\t".join(header) + "\n")
@@ -354,6 +355,7 @@ def _write_traits_tsv(
                  str(int(n_variants_arr[i])), str(int(n_imputed_arr[i])),
                  str(int(n_variants_var_y_arr[i]))]
                 + sig_vals
+                + [t.vcf_path or "", t.vcf_build or ""]
             )
             fh.write("\t".join(row) + "\n")
 
@@ -471,6 +473,7 @@ def build_database(
     ld_ancestry: str = "EUR",
     ld_thresh: float = 0.9,
     ld_min_cor: float = 0.7,
+    ld_vcf_threads: int = 8,
 ) -> None:
     out = Path(output_dir)
     if out.exists() and not overwrite:
@@ -627,10 +630,16 @@ def build_database(
         neff_full = decode_neff(neff_mat.get_block(0, V, 0, T))    # (V, T) float32
 
         imputed_mask = np.zeros((V, T), dtype=bool)
+        # Supply per-trait VCF paths so workers can read dense z-scores from
+        # the original GWAS-VCF files, improving imputation quality.
+        trait_vcf_paths = [(t.vcf_path, t.vcf_build) for t in trait_pairs]
         impute_z_block(
             z_full, variants, eaf, block_index,
             thresh=ld_thresh, min_cor=ld_min_cor,
             out_mask=imputed_mask,
+            workers=workers,
+            vcf_paths=trait_vcf_paths,
+            vcf_threads=ld_vcf_threads,
         )
 
         # Assign per-trait median Neff to imputed positions so betas are recoverable.

@@ -90,21 +90,25 @@ def _load_variants_tsv(
 
 def _load_traits_tsv(
     path: "Path",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Parse ``traits.tsv`` → (traits structured array, neff_study, var_y).
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[str | None]]":
+    """Parse ``traits.tsv`` → (traits, neff_study, var_y, vcf_paths, vcf_builds).
 
-    Shared by the ``traits``, ``neff_base``, and ``var_y`` properties; all
-    three are populated in a single pass so the file is only read once.
+    Shared by the ``traits``, ``neff_base``, ``var_y``, and ``vcf_paths``
+    properties; all are populated in a single pass so the file is only read once.
 
     Returns
     -------
     traits      : structured array with fields id(U64), name(U256)
     neff_study  : float32(T) — study-level Neff per trait (used as Neff fallback)
     var_y       : float32(T) — per-trait phenotypic variance (NaN if unknown)
+    vcf_paths   : list[str] — VCF file path per trait (empty string when absent)
+    vcf_builds  : list[str | None] — genome build per trait (None when absent)
     """
     rows: list[tuple[str, str]] = []
     neff_list: list[float] = []
     var_y_list: list[float] = []
+    vcf_paths: list[str] = []
+    vcf_builds: list[str | None] = []
     with open(path) as fh:
         header: list[str] | None = None
         for line in fh:
@@ -120,11 +124,14 @@ def _load_traits_tsv(
             neff_list.append(float(raw_neff) if raw_neff else np.nan)
             raw_vy = cells.get("var_y", "").strip()
             var_y_list.append(float(raw_vy) if raw_vy else np.nan)
+            vcf_paths.append(cells.get("vcf_path", "").strip())
+            raw_build = cells.get("vcf_build", "").strip()
+            vcf_builds.append(raw_build if raw_build else None)
 
     traits = np.array(rows, dtype=_TRAITS_DT)
     neff_study = np.array(neff_list, dtype=np.float32)
     var_y = np.array(var_y_list, dtype=np.float32)
-    return traits, neff_study, var_y
+    return traits, neff_study, var_y, vcf_paths, vcf_builds
 
 
 class GWASDatabase:
@@ -135,6 +142,8 @@ class GWASDatabase:
         self._traits: np.ndarray | None = None
         self._neff_base_arr: np.ndarray | None = None   # loaded together with _traits
         self._var_y_arr: np.ndarray | None = None        # loaded together with _traits
+        self._vcf_paths: "list[str] | None" = None       # loaded together with _traits
+        self._vcf_builds: "list[str | None] | None" = None  # loaded together with _traits
         self._zscore: ChunkedMatrix | None = None
         self._neff: ChunkedMatrix | None = None
         self._eaf: np.ndarray | None = None
@@ -192,11 +201,15 @@ class GWASDatabase:
         return self._variants
 
     def _ensure_traits_loaded(self) -> None:
-        """Load traits.tsv once, populating _traits, _neff_base_arr, _var_y_arr."""
+        """Load traits.tsv once, populating _traits, _neff_base_arr, _var_y_arr, and VCF paths."""
         if self._traits is None:
-            self._traits, self._neff_base_arr, self._var_y_arr = _load_traits_tsv(
-                self.path / "traits.tsv"
-            )
+            (
+                self._traits,
+                self._neff_base_arr,
+                self._var_y_arr,
+                self._vcf_paths,
+                self._vcf_builds,
+            ) = _load_traits_tsv(self.path / "traits.tsv")
 
     @property
     def traits(self) -> np.ndarray:
@@ -218,6 +231,16 @@ class GWASDatabase:
         """Per-trait phenotypic variance from traits.tsv (float32, NaN if unknown)."""
         self._ensure_traits_loaded()
         return self._var_y_arr
+
+    @property
+    def vcf_paths(self) -> "list[tuple[str, str | None]]":
+        """Per-trait (vcf_path, vcf_build) pairs from traits.tsv.
+
+        Returns an empty string for vcf_path and None for vcf_build when the
+        database was built without these columns (backward-compatible).
+        """
+        self._ensure_traits_loaded()
+        return list(zip(self._vcf_paths, self._vcf_builds))
 
     @property
     def lambda_matrix(self) -> ChunkedMatrix:

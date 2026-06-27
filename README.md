@@ -114,10 +114,58 @@ pleiodb rho my.pleiodb --traits ieu-a-7,ukb-b-10787,ukb-b-19953 --matrix
 `pleiodb info` reports `rho_present` and emits a warning when the rho matrix
 has not yet been computed.
 
+## LD-based z-score imputation
+
+When `--ld-dir` is supplied at build time, pleiodb runs a post-build imputation pass that
+fills missing z-scores using elastic-net regression on LD eigenvectors.
+
+**How it works** (dense VCF mode):
+
+1. After all traits are ingested, for each LD block pleiodb identifies traits that have
+   missing z-scores at positions covered by that block.
+2. For those traits it reads z-scores for **all** variants in the LD block directly from
+   the source GWAS-VCF files — not just the ~95k stored variants, but the full set of
+   reference panel variants (~5–10k per block).
+3. Precomputed block eigenvectors (stored as `.ldeig.rds` alongside the LD panel) are
+   loaded and cached as `.ldeig.npz` on first use (~62 ms cached vs ~3–5 s cold).
+4. An elastic-net model is trained on the dense z-score vector using the eigenvectors
+   as features; predictions are extracted only for the missing stored positions.
+5. A polynomial rescaling step corrects bias and variance of the imputed values.
+
+**Why dense beats sparse**: the stored variant set covers only 20–50 of the ~5–10k
+reference panel SNPs per block (0.4–1%). Training on the full dense set gives the
+elastic net far more signal to learn the local LD pattern.
+
+**Benchmark (chr1, 5 traits, 32 workers):** 0.71 s/block with dense VCF mode.
+
+```bash
+# Build with LD imputation (requires LD reference panel and hg38 variant list)
+pleiodb build my.pleiodb \
+  --variants variants_hg38.tsv \
+  --traits   traits.tsv \
+  --ld-dir   /data/ld_reference_panel_hg38/EUR \
+  --workers  32 \
+  --ld-vcf-threads 8
+```
+
+The traits TSV must include a `vcf_path` column (and optionally a `build` column for
+hg19 VCFs) so that pleiodb can read back the source files during imputation:
+
+```
+trait_id    trait_name          N       K     vcf_path                    build
+ieu-b-2     Body mass index     461460        /data/gwas/bmi.vcf.gz       hg38
+ukb-b-1234  LDL cholesterol     94595         /data/gwas/ldl.vcf.gz       hg19
+```
+
+Imputed positions are recorded in `imputed.coo.zst` inside the database directory
+(COO-format sparse array of (variant_idx, trait_idx) pairs). `pleiodb info` reports
+the total imputed cell count.
+
 ## CLI reference
 
 ```
 pleiodb build   OUTPUT  --variants TSV  --traits TSV  [--workers N]  [--variants-build BUILD]
+                        [--ld-dir DIR]  [--ld-vcf-threads N]  [--ld-thresh F]  [--ld-min-cor F]
 pleiodb rho     DB      [--null-thresh FLOAT]  [--min-nulls INT]  [--workers N]
                         [--traits t1,t2,...]   [--traits-file FILE]
                         [--matrix]  [--format tsv|json]  [-o FILE]
