@@ -43,7 +43,7 @@ from .alid import canonical_alid, compress_allele, parse_alid
 from .quantize import encode_z, encode_neff, encode_eaf, Z_NA
 from .store import ChunkedMatrix
 from .vcf import read_vcf
-from .liftover import builds_differ, make_lifted_lookup, normalise_build
+from .liftover import builds_differ, lift_variants, make_lifted_lookup, normalise_build
 
 log = logging.getLogger(__name__)
 _CCTX = zstd.ZstdCompressor(level=3, threads=-1)
@@ -338,6 +338,7 @@ def _write_traits_tsv(
         ["trait_id", "trait_name", "N", "K", "neff_study", "var_y",
          "n_variants", "n_variants_imputed", "n_variants_var_y"]
         + sig_cols
+        + ["vcf_path", "vcf_build"]
     )
     with open(path, "w") as fh:
         fh.write("\t".join(header) + "\n")
@@ -354,6 +355,7 @@ def _write_traits_tsv(
                  str(int(n_variants_arr[i])), str(int(n_imputed_arr[i])),
                  str(int(n_variants_var_y_arr[i]))]
                 + sig_vals
+                + [t.vcf_path or "", t.vcf_build or ""]
             )
             fh.write("\t".join(row) + "\n")
 
@@ -362,25 +364,32 @@ def _write_variants_tsv(
     path: Path,
     variants: np.ndarray,
     eaf: np.ndarray,
+    variants_hg38: np.ndarray | None = None,
 ) -> None:
     """Write ``variants.tsv`` — the per-variant metadata file inside .pleiodb.
 
     Format (tab-separated, header row)::
 
-        alid    eaf
-        1:100_A_T   0.35
+        alid    eaf    [alid_hg38]
+        1:100_A_T   0.35   1:200_A_T
         ...
 
     Row order matches the V-axis of all binary matrices.  ``eaf`` values that
-    are NaN are written as empty strings.
+    are NaN are written as empty strings.  The optional ``alid_hg38`` column is
+    written only when *variants_hg38* is provided (i.e. a liftover was performed).
     """
     with open(path, "w") as fh:
-        fh.write("alid\teaf\n")
+        header = "alid\teaf\talid_hg38\n" if variants_hg38 is not None else "alid\teaf\n"
+        fh.write(header)
         for i in range(len(variants)):
             alid = str(variants["id"][i])
             e = float(eaf[i])
             eaf_str = f"{e:.6g}" if np.isfinite(e) else ""
-            fh.write(f"{alid}\t{eaf_str}\n")
+            if variants_hg38 is not None:
+                alid_hg38 = str(variants_hg38["id"][i])
+                fh.write(f"{alid}\t{eaf_str}\t{alid_hg38}\n")
+            else:
+                fh.write(f"{alid}\t{eaf_str}\n")
 
 
 def _build_pos_lookup(
@@ -464,6 +473,7 @@ def build_database(
     ld_ancestry: str = "EUR",
     ld_thresh: float = 0.9,
     ld_min_cor: float = 0.7,
+    ld_vcf_threads: int = 8,
 ) -> None:
     out = Path(output_dir)
     if out.exists() and not overwrite:
@@ -482,6 +492,15 @@ def build_database(
         "Building pleiodb: V=%d  T=%d  chunks=%s  variants_build=%s",
         V, T, chunk_shape, canon_build or "unspecified",
     )
+
+    # --- Lift variant list to hg38 for LD panel matching (when needed) ------
+    # The LD panel is always in hg38; when variants are in another build we
+    # lift a copy of the array to hg38 so build_block_index can match ALIDs.
+    # The original coordinates are preserved for VCF reading and stored as the
+    # primary 'alid' column; the lifted coordinates are stored as 'alid_hg38'.
+    variants_hg38: np.ndarray | None = None
+    if ld_dir is not None and canon_build is not None and canon_build != "hg38":
+        variants_hg38 = lift_variants(variants, canon_build, "hg38")
 
     # --- Build pos_lookup and regions file for same-build traits ------------
     direct_pos_lookup = _build_pos_lookup(variants)
@@ -507,7 +526,7 @@ def build_database(
         return _lifted_cache[vcf_build_norm], _lifted_regions_cache[vcf_build_norm]
 
     # ---- Write variant metadata (TSV replaces variants.npy + eaf.f16) ------
-    _write_variants_tsv(out / "variants.tsv", variants, eaf)
+    _write_variants_tsv(out / "variants.tsv", variants, eaf, variants_hg38)
 
     # ---- Initialise chunked matrices ---------------------------------------
     zscore_mat = ChunkedMatrix(out / "zscore", (V, T), np.int16, chunk_shape)
@@ -525,13 +544,9 @@ def build_database(
     block_index: dict = {}
     if ld_dir is not None:
         from .impute import build_block_index
-        if canon_build not in ("hg38", "GRCh38") and canon_build is not None:
-            log.warning(
-                "--ld-dir supplied but --variants-build is %s (not hg38); "
-                "LD panel is in hg38 coordinates – variant matching may be incorrect",
-                canon_build,
-            )
-        block_index = build_block_index(variants, Path(ld_dir), ld_ancestry)
+        # Use hg38-lifted variant array when available; otherwise use original.
+        _variants_for_ld = variants_hg38 if variants_hg38 is not None else variants
+        block_index = build_block_index(_variants_for_ld, Path(ld_dir), ld_ancestry)
 
     # Running COO lists for the imputed-positions mask
     imputed_coo_v: list[np.ndarray] = []
@@ -561,30 +576,13 @@ def build_database(
                 n_done += 1
                 log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
-        # ---- LD imputation (optional) ----------------------------------------
-        imputed_mask_block = np.zeros((V, B), dtype=bool)
-        if block_index:
-            from .impute import impute_z_block
-            impute_z_block(
-                z_block, variants, eaf, block_index,
-                thresh=ld_thresh, min_cor=ld_min_cor,
-                out_mask=imputed_mask_block,
-            )
-            hv, ht = np.where(imputed_mask_block)
-            if len(hv):
-                imputed_coo_v.append(hv.astype(np.uint32))
-                imputed_coo_t.append((ht + t_block_start).astype(np.uint32))
-
         # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
         for j, t in enumerate(batch_traits):
             global_t = t_block_start + j
             neff_study = compute_neff_study(t.N, t.K)
 
-            # n_variants counts only *observed* (pre-imputation) z-scores
-            n_variants_arr[global_t] = int(
-                (np.isfinite(z_block[:, j]) & ~imputed_mask_block[:, j]).sum()
-            )
-            n_imputed_arr[global_t] = int(imputed_mask_block[:, j].sum())
+            # n_variants counts observed finite z-scores; n_imputed filled post-build
+            n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
 
             # Validate that the VCF contained usable SE values
             if not np.any(np.isfinite(se_block[:, j])):
@@ -621,6 +619,63 @@ def build_database(
 
     zscore_mat.close_write()
     neff_mat.close_write()
+
+    # ---- Post-build imputation pass (single pass over all LD blocks) -------
+    if block_index:
+        from .impute import impute_z_block
+        from .quantize import decode_z, decode_neff
+
+        log.info("Post-build imputation pass: loading V×T matrices…")
+        z_full = decode_z(zscore_mat.get_block(0, V, 0, T))        # (V, T) float32
+        neff_full = decode_neff(neff_mat.get_block(0, V, 0, T))    # (V, T) float32
+
+        imputed_mask = np.zeros((V, T), dtype=bool)
+        # Supply per-trait VCF paths so workers can read dense z-scores from
+        # the original GWAS-VCF files, improving imputation quality.
+        trait_vcf_paths = [(t.vcf_path, t.vcf_build) for t in trait_pairs]
+        impute_z_block(
+            z_full, variants, eaf, block_index,
+            thresh=ld_thresh, min_cor=ld_min_cor,
+            out_mask=imputed_mask,
+            workers=workers,
+            vcf_paths=trait_vcf_paths,
+            vcf_threads=ld_vcf_threads,
+        )
+
+        # Assign per-trait median Neff to imputed positions so betas are recoverable.
+        # neff[v] = var_y / (SE² × 2·EAF·(1−EAF)) ≈ N_study independent of EAF,
+        # so the trait median is a valid approximation for any imputed variant.
+        neff_full = np.where(imputed_mask, neff_base[np.newaxis, :], neff_full)
+
+        # Update per-trait counts
+        n_imputed_arr[:] = imputed_mask.sum(axis=0)
+        n_variants_arr -= n_imputed_arr   # exclude imputed from observed count
+
+        # Accumulate COO mask
+        hv, ht = np.where(imputed_mask)
+        if len(hv):
+            imputed_coo_v.append(hv.astype(np.uint32))
+            imputed_coo_t.append(ht.astype(np.uint32))
+
+        # Rewrite both files atomically (temp → replace)
+        log.info("Rewriting z-score and Neff files with imputed values…")
+        zscore_tmp = ChunkedMatrix(out / "zscore_tmp", (V, T), np.int16, chunk_shape)
+        neff_tmp = ChunkedMatrix(out / "neff_tmp", (V, T), np.uint16, chunk_shape)
+        zscore_tmp.open_write()
+        neff_tmp.open_write()
+        for vi in range(zscore_mat.n_v_chunks):
+            v0, v1 = vi * CV, min((vi + 1) * CV, V)
+            for ti in range(zscore_mat.n_t_chunks):
+                t0, t1 = ti * CT, min((ti + 1) * CT, T)
+                zscore_tmp.write_chunk(vi, ti, encode_z(z_full[v0:v1, t0:t1]))
+                neff_tmp.write_chunk(vi, ti, encode_neff(neff_full[v0:v1, t0:t1]))
+        zscore_tmp.close_write()
+        neff_tmp.close_write()
+        (out / "zscore_tmp.bin").replace(out / "zscore.bin")
+        (out / "zscore_tmp.cidx").replace(out / "zscore.cidx")
+        (out / "neff_tmp.bin").replace(out / "neff.bin")
+        (out / "neff_tmp.cidx").replace(out / "neff.cidx")
+        log.info("Post-build imputation complete.")
 
     # ---- Imputed-positions mask --------------------------------------------
     _write_imputed_coo(out, imputed_coo_v, imputed_coo_t)
@@ -663,6 +718,7 @@ def build_database(
         "neff_encoding": "log2_u16_frac11",
         "format_version": 3,
         "variants_build": canon_build,
+        "variants_hg38_stored": variants_hg38 is not None,
         "var_y": var_y_list,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))

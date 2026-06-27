@@ -385,3 +385,162 @@ metrics
 
 - Correlation degrades gracefully as the mask fraction increases (see
   @sec-sensitivity), but remains useful even at 60–70% masking in the signal region.
+
+---
+
+## Build-level imputation: trial100 (hg19 VCFs)
+
+This section examines how many variants are actually imputed in the `trial100_imputed_v2`
+database, which was built from **hg19 VCF files** using the hg38 LD reference panel.
+
+**Important context:** The source VCF files are in hg19 coordinates but the LD panel is
+in hg38. During the build, the variant list is automatically lifted from hg19 → hg38 so
+that ALIDs can be matched against the LD panel. The original hg19 ALID remains the primary
+identifier and is what is stored in the z-score matrix; the hg38 ALID is only used for LD
+block matching and is stored as the `alid_hg38` column in `variants.tsv`.
+
+```{python}
+#| label: build-setup
+import sys
+sys.path.insert(0, "/home/gh13047/repo/pleiodb/src")
+
+import json
+import zstandard as zstd
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from pleiodb.db import GWASDatabase
+from pleiodb.quantize import decode_z
+
+DB_V2  = Path("/local-scratch/data/pleiodb/trial100_imputed_v2.pleiodb")
+DB_V1  = Path("/local-scratch/data/pleiodb/trial100_imputed.pleiodb")   # pre-fix (839 matches)
+DB_B1  = Path("/local-scratch/data/pleiodb/trial100_eaf.pleiodb")       # no imputation
+
+db = GWASDatabase.open(DB_V2)
+V, T = db.V, db.T
+meta = json.loads((DB_V2 / "meta.json").read_text())
+
+print(f"Database: {DB_V2.name}")
+print(f"Dimensions: V={V:,}  T={T}")
+print(f"variants_build:      {meta.get('variants_build')}")
+print(f"variants_hg38_stored: {meta.get('variants_hg38_stored')}")
+```
+
+```{python}
+#| label: liftover-coverage
+variants = db.variants
+n_with_hg38 = int((variants["id_hg38"] != "").sum())
+n_unchanged = int(
+    np.sum(variants["id_hg38"] == variants["id"])
+)
+n_lifted = n_with_hg38 - n_unchanged
+
+print(f"Total variants:              {V:,}")
+print(f"  With hg38 ALID stored:     {n_with_hg38:,}  ({100*n_with_hg38/V:.1f}%)")
+print(f"  Successfully lifted:        {n_lifted:,}  ({100*n_lifted/V:.1f}%)")
+print(f"  Liftover failed (hg19=hg38 same): {n_unchanged:,}  ({100*n_unchanged/V:.1f}%)")
+```
+
+```{python}
+#| label: imputation-stats
+
+def load_imputed_coo(db_path, V, T):
+    raw = zstd.ZstdDecompressor().decompress((db_path / "imputed.coo.zst").read_bytes())
+    n = len(raw) // 8
+    if n == 0:
+        return np.zeros((V, T), dtype=bool)
+    pairs = np.frombuffer(raw, dtype=np.uint32).reshape(n, 2)
+    mask = np.zeros((V, T), dtype=bool)
+    mask[pairs[:, 0], pairs[:, 1]] = True
+    return mask
+
+imp_v2 = load_imputed_coo(DB_V2, V, T)
+imp_v1 = load_imputed_coo(DB_V1, V, T) if DB_V1.exists() else None
+
+# Load z-scores for missingness comparison
+z_mat = decode_z(db._zscore.get_block(0, V, 0, T))
+n_finite = int(np.isfinite(z_mat).sum())
+n_total  = V * T
+n_missing_before = n_total - (n_finite - int(imp_v2.sum()))  # missing before imputation
+
+print(f"\nImputation statistics (v2 — with hg19→hg38 liftover fix):")
+print(f"  Cells imputed:          {imp_v2.sum():,}")
+print(f"  As % of V×T:            {100*imp_v2.sum()/n_total:.3f}%")
+print(f"  Total finite z-scores:  {n_finite:,}  ({100*n_finite/n_total:.1f}% of V×T)")
+print(f"  Missing before impute:  {n_missing_before:,}")
+if n_missing_before > 0:
+    print(f"  Missing filled by LD:   {100*imp_v2.sum()/n_missing_before:.2f}% of pre-imputation gaps")
+
+if imp_v1 is not None:
+    print(f"\nComparison (v1 — before liftover fix):")
+    print(f"  Cells imputed:          {imp_v1.sum():,}")
+    print(f"  Fold increase in v2:    {imp_v2.sum() / max(imp_v1.sum(), 1):.1f}×")
+```
+
+```{python}
+#| label: per-trait-imputation
+traits_df = pd.read_csv(DB_V2 / "traits.tsv", sep="\t")
+
+n_imputed_per_trait = traits_df["n_variants_imputed"].values
+n_observed_per_trait = traits_df["n_variants"].values
+miss_before = V - n_observed_per_trait  # missingness before imputation
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].hist(n_imputed_per_trait, bins=30, color="steelblue", edgecolor="black")
+axes[0].set_xlabel("Variants imputed per trait")
+axes[0].set_ylabel("Number of traits")
+axes[0].set_title("Imputed variants per trait (v2)")
+axes[0].text(0.97, 0.95,
+    f"median = {int(np.median(n_imputed_per_trait)):,}\nmax = {int(n_imputed_per_trait.max()):,}",
+    transform=axes[0].transAxes, ha="right", va="top", fontsize=9,
+    bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+# Missingness before vs after imputation
+miss_after = V - n_observed_per_trait - n_imputed_per_trait
+frac_before = miss_before / V
+frac_after  = miss_after / V
+
+axes[1].scatter(frac_before, frac_after, s=10, alpha=0.6, color="steelblue")
+axes[1].plot([0, 1], [0, 1], "r--", linewidth=0.8, label="no change")
+axes[1].set_xlabel("Missing fraction before imputation")
+axes[1].set_ylabel("Missing fraction after imputation")
+axes[1].set_title("Per-trait missingness: before vs after imputation")
+axes[1].legend(fontsize=8)
+
+fig.suptitle("Build-level imputation coverage (trial100, hg19 VCFs + hg38 LD panel)", fontsize=11)
+fig.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: ld-block-coverage
+# Show how many variants have an hg38 ALID (were lifted) vs total
+# and compare against how many actually got imputed
+variants_df = pd.read_csv(DB_V2 / "variants.tsv", sep="\t")
+has_hg38 = (variants_df["alid_hg38"].notna() & (variants_df["alid_hg38"] != "")).sum()
+n_imputed_variants = int(imp_v2.any(axis=1).sum())
+
+summary_df = pd.DataFrame({
+    "Metric": [
+        "Total variants",
+        "Variants lifted to hg38",
+        "Variants matched to ≥1 LD block",
+        "Variants with ≥1 imputed cell (any trait)",
+    ],
+    "Count": [V, has_hg38, n_imputed_variants, n_imputed_variants],
+    "% of total": [
+        100.0,
+        100 * has_hg38 / V,
+        "—",
+        100 * n_imputed_variants / V,
+    ]
+})
+print(summary_df.to_string(index=False))
+
+print(f"\nNote: source VCF files are hg19; the variant list was lifted to hg38 at")
+print(f"build time solely for LD panel ALID matching.  z-scores are stored using")
+print(f"the original hg19 ALID as the primary identifier.")
+```

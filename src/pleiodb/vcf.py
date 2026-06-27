@@ -180,6 +180,153 @@ def read_vcf(
             except OSError:
                 pass
 
+def _lift_region(
+    chrom: str,
+    start: int,
+    end: int,
+    from_build: str,
+    to_build: str,
+) -> "tuple[str, int, int] | None":
+    """Lift a genomic interval from *from_build* to *to_build*.
+
+    Returns ``(new_bare_chrom, new_start, new_end)`` on success, or ``None``
+    when either endpoint fails liftover (callers should return ``{}``).
+    """
+    try:
+        from pyliftover import LiftOver  # type: ignore
+    except ImportError:
+        raise ImportError("pyliftover is required for cross-build region queries")
+
+    from .liftover import normalise_build
+    lo = LiftOver(normalise_build(from_build), normalise_build(to_build))
+
+    bare = chrom.lstrip("chr")
+    chrom_in = f"chr{bare}"
+
+    r_start = lo.convert_coordinate(chrom_in, start - 1)
+    r_end = lo.convert_coordinate(chrom_in, end - 1)
+
+    if not r_start or not r_end:
+        return None
+
+    new_chrom = r_start[0][0].lstrip("chr")
+    new_start = int(r_start[0][1]) + 1
+    new_end = int(r_end[0][1]) + 1
+    return new_chrom, min(new_start, new_end), max(new_start, new_end)
+
+
+def read_vcf_region(
+    vcf_path: str | Path,
+    chrom: str,
+    start: int,
+    end: int,
+    vcf_build: "str | None" = None,
+) -> dict[str, float]:
+    """Extract z-scores for all variants in a genomic region from a GWAS-VCF.
+
+    Parameters
+    ----------
+    vcf_path  : path to a GWAS-VCF (bgzipped + indexed, or plain VCF)
+    chrom     : chromosome in hg38 coordinates (bare, e.g. "1"; "chr1" ok)
+    start     : region start (1-based, inclusive) in hg38 coordinates
+    end       : region end   (1-based, inclusive) in hg38 coordinates
+    vcf_build : genome build of the VCF (hg19/hg38/aliases).  When provided
+                and different from hg38, the region is lifted from hg38 to
+                *vcf_build* before issuing the bcftools query.  None / hg38
+                → no liftover performed.
+
+    Returns
+    -------
+    dict mapping ``"{bare_chrom}:{pos}_{ref}_{alt}"`` → z-score (effect of ALT).
+    An empty dict is returned when no variants are found, liftover fails, or
+    on any read error.
+
+    The keys are compatible with ``build_block_allele_lookup``: callers should
+    check ``is_flipped`` in the allele lookup and negate z when True.
+    """
+    from .liftover import normalise_build, builds_differ
+
+    path = str(vcf_path)
+    result: dict[str, float] = {}
+    bare = chrom.lstrip("chr")
+
+    # Liftover block coordinates when the VCF uses a different build from hg38
+    if vcf_build is not None and builds_differ("hg38", vcf_build):
+        lifted = _lift_region(bare, start, end, from_build="hg38", to_build=vcf_build)
+        if lifted is None:
+            log.warning(
+                "read_vcf_region: liftover hg38→%s failed for %s:%d-%d – returning {}",
+                vcf_build, chrom, start, end,
+            )
+            return result
+        bare, start, end = lifted
+
+    def _collect(recs) -> None:
+        for rec in recs:
+            if not rec.ALT:
+                continue
+            z = _extract_z(rec)
+            if z is None:
+                continue
+            ref = compress_allele(rec.REF)
+            alt = compress_allele(rec.ALT[0])
+            rec_bare = rec.CHROM.lstrip("chr")
+            result[f"{rec_bare}:{rec.POS}_{ref}_{alt}"] = z
+
+    if not _has_index(path):
+        vcf = _open_vcf(path)
+        try:
+            _collect(
+                rec for rec in vcf
+                if rec.CHROM.lstrip("chr") == bare and start <= rec.POS <= end
+            )
+        finally:
+            vcf.close()
+        return result
+
+    # Indexed: try bcftools region filter with both bare and chr-prefixed chrom forms
+    bcftools_ok = False
+    for region_chrom in (bare, f"chr{bare}"):
+        region = f"{region_chrom}:{start}-{end}"
+        fd, tmp_vcf = tempfile.mkstemp(suffix=".vcf")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["bcftools", "view", "-r", region, "-Ov", path, "-o", tmp_vcf],
+                stderr=subprocess.DEVNULL,
+            )
+            bcftools_ok = True
+            vcf = _open_vcf(tmp_vcf)
+            try:
+                recs = list(vcf)
+            finally:
+                vcf.close()
+            if recs:
+                _collect(recs)
+                return result
+        except (OSError, FileNotFoundError) as exc:
+            log.debug("bcftools region query failed (%s) – will fall back", exc)
+            break
+        finally:
+            try:
+                os.unlink(tmp_vcf)
+            except OSError:
+                pass
+
+    if not bcftools_ok:
+        # bcftools not available: full cyvcf2 scan filtered by position
+        vcf = _open_vcf(path)
+        try:
+            _collect(
+                rec for rec in vcf
+                if rec.CHROM.lstrip("chr") == bare and start <= rec.POS <= end
+            )
+        finally:
+            vcf.close()
+
+    return result
+
+
 def _extract_z(rec) -> float | None:
     try:
         ez = rec.format("EZ")

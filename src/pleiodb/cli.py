@@ -90,8 +90,10 @@ def main():
               help="[impute] Fraction of LD variance retained in PCA.")
 @click.option("--ld-min-cor", default=0.7, show_default=True, type=float,
               help="[impute] Min block-level correlation to accept imputed values.")
+@click.option("--ld-vcf-threads", default=8, show_default=True, type=int,
+              help="[impute] Threads per block worker for parallel VCF region reads.")
 def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwrite,
-          variants_build, ld_dir, ld_ancestry, ld_thresh, ld_min_cor):
+          variants_build, ld_dir, ld_ancestry, ld_thresh, ld_min_cor, ld_vcf_threads):
     """Build a pleiodb database from GWAS-VCF files."""
     from .build import build_database
     thresholds = [float(p) for p in pval]
@@ -108,6 +110,7 @@ def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwri
         ld_ancestry=ld_ancestry,
         ld_thresh=ld_thresh,
         ld_min_cor=ld_min_cor,
+        ld_vcf_threads=ld_vcf_threads,
     )
     click.echo(f"Database written to {output_dir}")
 

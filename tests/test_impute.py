@@ -1,10 +1,11 @@
-"""Tests for src/pleiodb/impute.py (issues 033–035)."""
+"""Tests for src/pleiodb/impute.py (issues 033–035) and liftover.lift_variants (issue 037)."""
 from __future__ import annotations
 
 import gzip
 import io
 import textwrap
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -415,3 +416,102 @@ class TestImputeZBlock:
         z_block[0, 0] = np.nan
         # Should not raise with out_mask=None
         impute_z_block(z_block, variants, eaf, block_index={}, thresh=0.9, min_cor=0.7)
+
+
+# ---------------------------------------------------------------------------
+# Issue 037 – lift_variants unit tests
+# ---------------------------------------------------------------------------
+
+def _make_variants_full(alids: list[str]) -> np.ndarray:
+    """Build a variants structured array matching the build.py dtype."""
+    dt = np.dtype([
+        ("id", "U64"), ("chrom", "U10"), ("pos", np.uint32),
+        ("a1", "U64"), ("a2", "U64"),
+    ])
+    rows = []
+    for alid in alids:
+        chrom, rest = alid.split(":", 1)
+        pos_str, a1, a2 = rest.split("_", 2)
+        rows.append((alid, chrom, int(pos_str), a1, a2))
+    return np.array(rows, dtype=dt)
+
+
+class TestLiftVariants:
+    """Unit tests for liftover.lift_variants using a mocked LiftOver."""
+
+    ALIDS_HG19 = [
+        "1:1000_A_G",
+        "2:2000_C_T",
+        "3:3000_A_C",
+    ]
+    # Fake hg38 positions returned by the mock
+    HG38_POS = {
+        ("chr1", 999):  [("chr1", 1100, "+", 0)],
+        ("chr2", 1999): [("chr2", 2200, "+", 0)],
+        ("chr3", 2999): [],  # simulate liftover failure for this variant
+    }
+
+    def _mock_lo(self):
+        """Return a MagicMock LiftOver instance using HG38_POS."""
+        lo = MagicMock()
+        lo.convert_coordinate.side_effect = lambda chrom, pos0: self.HG38_POS.get(
+            (chrom, pos0), []
+        )
+        return lo
+
+    def _run(self, alids=None):
+        from pleiodb.liftover import lift_variants
+        variants = _make_variants_full(alids or self.ALIDS_HG19)
+        lo = self._mock_lo()
+        with patch("pyliftover.LiftOver", return_value=lo):
+            return lift_variants(variants, "hg19", "hg38"), variants
+
+    def test_length_unchanged(self):
+        result, original = self._run()
+        assert len(result) == len(original)
+
+    def test_dtype_unchanged(self):
+        result, original = self._run()
+        assert result.dtype == original.dtype
+
+    def test_successful_lift_updates_pos(self):
+        result, _ = self._run()
+        # variant 0: chr1:1000 → chr1:1101 (pos0=999 → result pos0=1100 → pos=1101)
+        assert result["pos"][0] == 1101
+        assert result["id"][0] == "1:1101_A_G"
+        assert result["chrom"][0] == "1"
+
+    def test_successful_lift_updates_second_variant(self):
+        result, _ = self._run()
+        assert result["pos"][1] == 2201
+        assert result["id"][1] == "2:2201_C_T"
+
+    def test_failed_lift_keeps_original(self):
+        result, original = self._run()
+        # variant 2 fails; should retain original values
+        assert result["pos"][2] == original["pos"][2]
+        assert result["id"][2] == original["id"][2]
+        assert result["chrom"][2] == original["chrom"][2]
+
+    def test_alleles_unchanged(self):
+        result, original = self._run()
+        for i in range(len(original)):
+            assert result["a1"][i] == original["a1"][i]
+            assert result["a2"][i] == original["a2"][i]
+
+    def test_original_array_not_mutated(self):
+        result, original = self._run()
+        orig_ids = list(original["id"])
+        assert result["id"][0] != orig_ids[0]  # liftover changed id[0]
+        assert original["id"][0] == orig_ids[0]  # original unchanged
+
+    def test_no_liftover_needed_returns_same_values(self):
+        """When all variants lift successfully, no original values remain."""
+        from pleiodb.liftover import lift_variants
+        alids = ["1:1000_A_G", "2:2000_C_T"]
+        variants = _make_variants_full(alids)
+        lo = MagicMock()
+        lo.convert_coordinate.return_value = [("chr1", 5000, "+", 0)]
+        with patch("pyliftover.LiftOver", return_value=lo):
+            result = lift_variants(variants, "hg19", "hg38")
+        assert all(result["pos"] == 5001)
