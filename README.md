@@ -143,7 +143,8 @@ elastic net far more signal to learn the local LD pattern.
 pleiodb build my.pleiodb \
   --variants variants_hg38.tsv \
   --traits   traits.tsv \
-  --ld-dir   /data/ld_reference_panel_hg38/EUR \
+  --ld-dir   /data/ld_reference_panel_hg38 \
+  --ld-ancestry EUR \
   --workers  32 \
   --ld-vcf-threads 8
 ```
@@ -165,7 +166,9 @@ the total imputed cell count.
 
 ```
 pleiodb build   OUTPUT  --variants TSV  --traits TSV  [--workers N]  [--variants-build BUILD]
-                        [--ld-dir DIR]  [--ld-vcf-threads N]  [--ld-thresh F]  [--ld-min-cor F]
+                        [--chunk-v N]  [--chunk-t N]  [--overwrite]  [--resume]
+                        [--ld-dir DIR]  [--ld-ancestry STR]  [--ld-vcf-threads N]
+                        [--ld-thresh F]  [--ld-min-cor F]
 pleiodb rho     DB      [--null-thresh FLOAT]  [--min-nulls INT]  [--workers N]
                         [--traits t1,t2,...]   [--traits-file FILE]
                         [--matrix]  [--format tsv|json]  [-o FILE]
@@ -174,6 +177,9 @@ pleiodb query   DB      --variant ID | --trait ID | --region CHR:START-END | --p
                         [--format tsv|json]  [-o FILE]
 pleiodb info    DB
 ```
+
+`--resume` continues an interrupted build from the checkpoint written in OUTPUT.
+`--overwrite` discards any existing OUTPUT and starts fresh.
 
 Pass `--variants-build hg38` (or `hg19`) when your variant list and VCF files are on different
 genome builds — pleiodb will lift coordinates automatically using `pyliftover`.

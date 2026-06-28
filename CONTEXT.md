@@ -63,7 +63,7 @@ _Avoid_: RAF (retired — "reference" is ambiguous between genome-ref and canoni
 ### Storage
 
 **Database** (`*.pleiodb`):
-The output directory containing all binary matrices, metadata, and index files for one collection of variants × traits.
+The output directory containing all binary matrices, metadata, and index files for one collection of variants × traits. During an active build a `build_checkpoint.json` file is also present; it is deleted on successful completion and can be used to resume an interrupted build via `pleiodb build --resume`.
 
 **Chunk**:
 The unit of compressed storage: a rectangular submatrix of fixed size (default 512×512 cells) stored as a single Zstandard-compressed blob.
@@ -96,7 +96,8 @@ A human-readable tab-separated file with one row per trait. Row order defines th
 | `K` | case fraction (empty for continuous) |
 | `neff_study` | `N` (continuous) or `4·N·K·(1−K)` (binary) |
 | `var_y` | estimated phenotypic variance (median across common-MAF variants) |
-| `n_variants` | variants with valid data for this trait |
+| `n_variants` | observed (pre-imputation) variants with a valid z-score for this trait |
+| `n_variants_imputed` | cells filled by LD imputation (0 when `--ld-dir` is not supplied) |
 | `n_variants_var_y` | variants used in the var_y median estimate (EAF ∈ (0.01, 0.99), valid SE) |
 | `n_sig_{threshold}` | number of significant variants at each p-value threshold (one column per threshold, e.g. `n_sig_5e-8`, `n_sig_1e-5`) |
 

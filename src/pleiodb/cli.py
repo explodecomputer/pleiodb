@@ -72,6 +72,8 @@ def main():
 @click.option("--pval", multiple=True, default=["5e-8", "1e-5"],
               show_default=True, help="P-value threshold(s) for significance masks")
 @click.option("--overwrite", is_flag=True, default=False)
+@click.option("--resume", is_flag=True, default=False,
+              help="Resume an interrupted build from the checkpoint in OUTPUT_DIR.")
 @click.option(
     "--variants-build", default=None,
     help="Genome build of the variant list (hg19/hg38/GRCh37/GRCh38). "
@@ -93,7 +95,7 @@ def main():
 @click.option("--ld-vcf-threads", default=8, show_default=True, type=int,
               help="[impute] Threads per block worker for parallel VCF region reads.")
 def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwrite,
-          variants_build, ld_dir, ld_ancestry, ld_thresh, ld_min_cor, ld_vcf_threads):
+          resume, variants_build, ld_dir, ld_ancestry, ld_thresh, ld_min_cor, ld_vcf_threads):
     """Build a pleiodb database from GWAS-VCF files."""
     from .build import build_database
     thresholds = [float(p) for p in pval]
@@ -105,6 +107,7 @@ def build(output_dir, variants, traits, chunk_v, chunk_t, workers, pval, overwri
         workers=workers,
         pval_thresholds=thresholds,
         overwrite=overwrite,
+        resume=resume,
         variants_build=variants_build,
         ld_dir=ld_dir,
         ld_ancestry=ld_ancestry,

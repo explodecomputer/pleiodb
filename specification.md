@@ -18,20 +18,22 @@ The design prioritises:
 ```
 study.pleiodb/
 ├── meta.json           ← dimensions, chunk sizes, encoding params, format version
-├── variants.npy        ← structured array (V rows)
-├── traits.npy          ← structured array (T rows)
+├── variants.tsv        ← per-variant metadata: ALID, EAF, [alid_hg38]
+├── traits.tsv          ← per-trait metadata: IDs, var_y, n_variants, n_variants_imputed, …
 ├── zscore.bin          ← V×T  int16  compressed chunks
 ├── zscore.cidx         ← uint64 offset index for zscore.bin
 ├── neff.bin            ← V×T  uint16 compressed chunks
 ├── neff.cidx
-├── eaf.f16             ← V    float16  effect allele freq (A2, one value per variant)
-├── neff_base.f32       ← T    float32  (per-trait median Neff, fallback)
-├── lambda.bin          ← T×T  float16  compressed chunks
-├── lambda.cidx
+├── rho.bin             ← T×T  float16  compressed chunks  (post-build step)
+├── rho.cidx
+├── imputed.coo.zst     ← COO (v_idx u32, t_idx u32) of LD-imputed positions
 └── masks/
     ├── 5e-8.coo.zst    ← COO pairs (v_idx u32, t_idx u32), Zstd-compressed
     └── 1e-5.coo.zst
 ```
+
+During an active build, `build_checkpoint.json` is also present and deleted on
+successful completion.
 
 ---
 
@@ -92,11 +94,11 @@ reconstruction.
 
 ---
 
-### 4. Sample overlap / lambda matrix  `lambda`  — T × T, `float16`
+### 4. Rho matrix  `rho`  — T × T, `float16`
 
-Estimated as pairwise Pearson correlations of z-scores at null variants
-(|z| < 3.0 in both traits).  Stored symmetric (full T×T) in the same
-chunked format as the main matrices.
+Estimated via conditional maximum-likelihood on null variants (|z| < 1.0 in
+both traits by default; configurable via `--null-thresh`).  Stored symmetric
+(full T×T) in the same chunked format as the main matrices.
 
 | Property | Value |
 |---|---|
@@ -128,7 +130,7 @@ to a full scan.
 
 ## Chunk format
 
-Every chunked matrix (zscore, neff, lambda) uses an identical two-file layout:
+Every chunked matrix (zscore, neff, rho) uses an identical two-file layout:
 
 ```
 {name}.bin   — concatenated Zstandard-compressed chunk blobs
@@ -137,9 +139,10 @@ Every chunked matrix (zscore, neff, lambda) uses an identical two-file layout:
                cidx[i+1] = end byte of chunk i in .bin
 ```
 
-**Chunk ordering:** row-major over (v\_chunk, t\_chunk).
+**Chunk ordering:** column-major over (t\_chunk, v\_chunk) — all v-chunks for t-chunk 0
+are written before t-chunk 1.
 ```
-chunk_id = vi * n_t_chunks + ti
+chunk_id = ti * n_v_chunks + vi
 ```
 
 **Default chunk dimensions:** 512 × 512 (configurable at build time).
@@ -165,7 +168,7 @@ Blosc was considered but rejected to avoid the HDF5/Blosc dependency chain.
 |---|---|---|
 | zscore int16 | 1.2–1.5× | Near-random; shuffle helps marginally |
 | neff uint16 | 2–4× | Many identical values within a trait |
-| lambda float16 | 1.5–2× | Smooth correlation structure |
+| rho float16 | 1.5–2× | Smooth correlation structure |
 | masks COO | 3–10× | Very sparse at GWS threshold |
 
 ---
@@ -176,8 +179,8 @@ Blosc was considered but rejected to avoid the HDF5/Blosc dependency chain.
 |---|---|---|
 | Z-score | 4.0 GB | 2.5–3.0 GB |
 | Neff | 4.0 GB | 1.5–2.0 GB |
-| RAF | 0.0002 GB | negligible |
-| Lambda | 0.8 GB | 0.4–0.6 GB |
+| EAF (in variants.tsv) | ~10 MB | negligible |
+| Rho | 0.8 GB | 0.4–0.6 GB |
 | Sig masks (2 thresh) | 0.05–0.6 GB | 0.03–0.3 GB |
 | Metadata / indices | <10 MB | — |
 | **Total** | **~9 GB** | **~5–6 GB** |
@@ -213,20 +216,23 @@ alphabetically), the z-score is negated so it reflects the effect of A2.
 
 ### `--traits`  (required)
 
-Tab-separated, no header.  Lines beginning with `#` are ignored.
+Tab-separated, **with header row**.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| 1 `trait_id` | string | Unique identifier for the trait (e.g. `ieu-b-2`, `ukb-b-1234`). Stored in the database and used in all query output. |
-| 2 `trait_name` | string | Optional human-readable label (e.g. `Body mass index`). Stored in the database; empty string if absent. |
-| 3 `vcf_path` | string | Absolute or relative path to a GWAS-VCF file (bgzipped `.vcf.gz` with CSI or TBI index recommended). |
-| 4 `build` | string | Optional genome build of the VCF (`hg19`, `hg38`, `GRCh37`, `GRCh38`). Used with `--variants-build` to trigger automatic liftover when builds differ. |
+| `trait_id` | string | Unique identifier for the trait (e.g. `ieu-b-2`, `ukb-b-1234`). Stored in the database and used in all query output. |
+| `trait_name` | string | Human-readable label (e.g. `Body mass index`). |
+| `N` | int | Total sample size (required). |
+| `K` | float | Case fraction `N_cases/N` in (0, 1). Required for binary traits; omit or leave blank for continuous. |
+| `vcf_path` | string | Absolute or relative path to a GWAS-VCF file (bgzipped `.vcf.gz` with CSI or TBI index recommended). |
+| `build` | string | Optional genome build of the VCF (`hg19`, `hg38`, `GRCh37`, `GRCh38`). Used with `--variants-build` to trigger automatic liftover when builds differ. |
 
 **Example:**
 ```
-ieu-b-2	Body mass index	/data/gwas/body_mass_index.gwas.vcf.gz	hg19
-ukb-b-1234	LDL cholesterol	/data/gwas/ukbb_ldl.gwas.vcf.gz	hg38
-finn-r-T2D		/data/gwas/finngen_T2D.vcf.gz
+trait_id    trait_name          N       K     vcf_path                                build
+ieu-b-2     Body mass index     461460        /data/gwas/body_mass_index.gwas.vcf.gz  hg19
+ukb-b-1234  LDL cholesterol     94595         /data/gwas/ukbb_ldl.gwas.vcf.gz         hg38
+finn-r-T2D  Type 2 diabetes     200000  0.15  /data/gwas/finngen_T2D.vcf.gz
 ```
 
 ---
@@ -322,37 +328,48 @@ pleiodb build  OUTPUT_DIR \
 ```
 
 **Algorithm:**
-1. Load variant list → integer index (variant → row).
+1. Load variant list → integer index (variant → row); write `variants.tsv`.
 2. Iterate traits in batches of `chunk_t` (one "column-slab").
 3. Within each batch, read VCF files in parallel using a thread pool.
-4. Quantise the `V × batch_T` z-score and Neff sub-matrices.
-5. Write row-chunks (size `chunk_v × batch_T`) to the .bin/.cidx files.
-6. After all traits: write RAF, compute and write significance masks.
-7. Optionally compute lambda matrix with `pleiodb lambda`.
+4. Estimate per-trait `var_y` and derive per-variant Neff from SE and EAF.
+5. Quantise the `V × batch_T` z-score and Neff sub-matrices.
+6. Write row-chunks (size `chunk_v × batch_T`) to `.bin` files; checkpoint state to `build_checkpoint.json`.
+7. If `--ld-dir` supplied: post-build imputation pass — fills missing z-scores via elastic-net on LD eigenvectors. Checkpointed per t-batch; restorable with `--resume`.
+8. Rewrite `.bin` files atomically with imputed values; write `imputed.coo.zst`.
+9. Write significance masks; write `traits.tsv` and `meta.json`. Delete checkpoint.
+10. Optionally compute rho matrix with `pleiodb rho`.
 
 Peak memory per process: `V × batch_T × 8 bytes ≈ 400 MB` at default settings.
 
 ---
 
-## Lambda computation
+## Rho computation
 
 ```
-pleiodb lambda  STUDY.pleiodb  --null-thresh 3.0  --workers 16
+pleiodb rho  STUDY.pleiodb  [--null-thresh 1.0]  [--min-nulls 500]  [--workers N]
 ```
 
-For each pair of traits (t1, t2), Pearson correlation is computed over the
-set of variants where both |z\_t1| < 3.0 and |z\_t2| < 3.0.  A minimum of
-30 variants is required; otherwise the entry is set to NaN.
+For each pair of traits (t1, t2), a conditional maximum-likelihood estimator
+(Forde et al.) is applied to null variants where both |z\_t1| < 1.0 and
+|z\_t2| < 1.0.  A minimum of 500 shared null variants is required; otherwise
+the entry is set to NaN.  The estimator corrects for the selection bias
+introduced by thresholding (unlike a naive Pearson r on truncated data).
 
-The lambda matrix is written as a separate chunked float16 matrix.
+The rho matrix is written as a separate chunked float16 matrix (`rho.bin/.cidx`).
 
 ---
 
 ## CLI reference
 
 ```
-pleiodb build   OUTPUT  --variants TSV  --traits TSV  [options]
-pleiodb lambda  DB      [--null-thresh FLOAT]  [--workers N]
+pleiodb build   OUTPUT  --variants TSV  --traits TSV  [--workers N]
+                        [--variants-build BUILD]  [--chunk-v N]  [--chunk-t N]
+                        [--overwrite]  [--resume]
+                        [--ld-dir DIR]  [--ld-ancestry STR]  [--ld-vcf-threads N]
+                        [--ld-thresh F]  [--ld-min-cor F]
+pleiodb rho     DB      [--null-thresh FLOAT]  [--min-nulls INT]  [--workers N]
+                        [--traits t1,t2,...]  [--traits-file FILE]
+                        [--matrix]  [--format tsv|json]  [-o FILE]
 pleiodb query   DB      [query options]  [--format tsv|json]  [-o FILE]
 pleiodb info    DB
 ```
@@ -435,7 +452,7 @@ float16 was considered but has non-uniform precision (coarser at large N).
 Log2 encoding with 11 fractional bits gives 0.034 % relative error uniformly
 across the range 1–2×10⁹, covers all plausible sample sizes, and fits in uint16.
 
-### Why store the full T×T lambda matrix (not upper triangle)?
+### Why store the full T×T rho matrix (not upper triangle)?
 
 Upper-triangle storage saves 50 % space (~400 MB) but requires branch logic
 on every access and complicates the chunk-based random-access pattern.

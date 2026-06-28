@@ -72,6 +72,17 @@ class ChunkedMatrix:
         self._wfp.close()
         np.array(self._offsets, dtype=np.uint64).tofile(self._cidx_path)
 
+    def open_write_resume(self, offsets: list) -> None:
+        """Open for appending given saved chunk byte offsets from a checkpoint.
+
+        Truncates .bin to the last known-good offset to discard any partial
+        chunk written before an interrupted build.
+        """
+        self._offsets = [int(x) for x in offsets]
+        with open(self._bin_path, "r+b") as f:
+            f.truncate(self._offsets[-1])
+        self._wfp = open(self._bin_path, "ab")
+
     # ------------------------------------------------------------------
     # Query API
     # ------------------------------------------------------------------

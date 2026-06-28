@@ -456,6 +456,24 @@ def _fetch_trait(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_FILE = "build_checkpoint.json"
+
+
+def _load_checkpoint(out: Path) -> dict | None:
+    cp_path = out / _CHECKPOINT_FILE
+    return json.loads(cp_path.read_text()) if cp_path.exists() else None
+
+
+def _save_checkpoint(out: Path, cp: dict) -> None:
+    tmp = (out / _CHECKPOINT_FILE).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cp))
+    tmp.replace(out / _CHECKPOINT_FILE)
+
+
+# ---------------------------------------------------------------------------
 # Main build routine
 # ---------------------------------------------------------------------------
 
@@ -474,18 +492,53 @@ def build_database(
     ld_thresh: float = 0.9,
     ld_min_cor: float = 0.7,
     ld_vcf_threads: int = 8,
+    resume: bool = False,
 ) -> None:
     out = Path(output_dir)
-    if out.exists() and not overwrite:
+    if out.exists() and not overwrite and not resume:
         raise FileExistsError(f"{out} already exists; pass overwrite=True to replace")
     out.mkdir(parents=True, exist_ok=True)
     (out / "masks").mkdir(exist_ok=True)
+
+    if not resume:
+        stale = out / _CHECKPOINT_FILE
+        if stale.exists():
+            stale.unlink()
+            log.warning("Removed stale checkpoint from a previous interrupted build.")
 
     variants, eaf = _load_variants(variants_path)
     trait_pairs = load_trait_list(trait_tsv)
     V = len(variants)
     T = len(trait_pairs)
     CV, CT = chunk_shape
+    n_t_chunks_total = (T + CT - 1) // CT
+
+    # ---- Resume / checkpoint state -----------------------------------------
+    cp: dict | None = None
+    ingestion_batches_done = 0
+    imputation_batches_done = 0
+
+    if resume:
+        cp = _load_checkpoint(out)
+        if cp is None:
+            log.warning("--resume: no checkpoint found; starting fresh.")
+        elif cp.get("phase") == "done":
+            log.info("Checkpoint shows build already complete; nothing to do.")
+            return
+        else:
+            ingestion_batches_done = int(cp.get("ingestion_t_batches_done", 0))
+            imputation_batches_done = int(cp.get("imputation_t_batches_done", 0))
+            log.info(
+                "Resuming build: phase=%s  ingestion_done=%d/%d  imputation_done=%d/%d",
+                cp.get("phase"), ingestion_batches_done, n_t_chunks_total,
+                imputation_batches_done, n_t_chunks_total,
+            )
+
+    ingestion_complete = (
+        cp is not None
+        and cp.get("phase") in ("imputation", "done")
+        and ingestion_batches_done >= n_t_chunks_total
+    )
 
     canon_build: str | None = normalise_build(variants_build) if variants_build else None
     log.info(
@@ -531,14 +584,26 @@ def build_database(
     # ---- Initialise chunked matrices ---------------------------------------
     zscore_mat = ChunkedMatrix(out / "zscore", (V, T), np.int16, chunk_shape)
     neff_mat = ChunkedMatrix(out / "neff", (V, T), np.uint16, chunk_shape)
-    zscore_mat.open_write()
-    neff_mat.open_write()
+
+    if not ingestion_complete:
+        if cp is not None and ingestion_batches_done > 0:
+            zscore_mat.open_write_resume(cp["ingestion_zscore_chunk_offsets"])
+            neff_mat.open_write_resume(cp["ingestion_neff_chunk_offsets"])
+        else:
+            zscore_mat.open_write()
+            neff_mat.open_write()
 
     var_y_arr = np.full(T, np.nan, dtype=np.float64)       # accumulated per-trait var_y
     neff_base = np.full(T, np.nan, dtype=np.float32)       # per-trait median Neff
     n_variants_arr = np.zeros(T, dtype=np.int64)            # finite z-score counts (observed)
     n_imputed_arr = np.zeros(T, dtype=np.int64)             # imputed z-score counts
     n_variants_var_y_arr = np.zeros(T, dtype=np.int64)      # variants used for var_y
+
+    if cp is not None and ingestion_batches_done > 0:
+        var_y_arr[:]            = [v if v is not None else np.nan for v in cp.get("var_y", [])]
+        neff_base[:]            = [v if v is not None else np.nan for v in cp.get("neff_base", [])]
+        n_variants_arr[:]       = cp.get("n_variants", [0] * T)
+        n_variants_var_y_arr[:] = cp.get("n_variants_var_y", [0] * T)
 
     # ---- LD imputation setup -------------------------------------------------
     block_index: dict = {}
@@ -553,103 +618,176 @@ def build_database(
     imputed_coo_t: list[np.ndarray] = []
 
     # ---- Main ingestion loop -----------------------------------------------
-    for t_block_start in range(0, T, CT):
-        t_block_end = min(t_block_start + CT, T)
-        batch_traits = trait_pairs[t_block_start:t_block_end]
-        B = len(batch_traits)
+    if not ingestion_complete:
+        for t_batch_idx, t_block_start in enumerate(range(0, T, CT)):
+            if t_batch_idx < ingestion_batches_done:
+                continue
 
-        z_block = np.full((V, B), np.nan, dtype=np.float32)
-        se_block = np.full((V, B), np.nan, dtype=np.float32)
-        neff_block = np.full((V, B), np.nan, dtype=np.float32)
+            t_block_end = min(t_block_start + CT, T)
+            batch_traits = trait_pairs[t_block_start:t_block_end]
+            B = len(batch_traits)
 
-        args = [
-            (j, t.trait_id, t.vcf_path, *_lookup_for(t.vcf_build), V)
-            for j, t in enumerate(batch_traits)
-        ]
-        n_done = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
-            for fut in as_completed(futures):
-                j, z, se = fut.result()
-                z_block[:, j] = z
-                se_block[:, j] = se
-                n_done += 1
-                log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
+            z_block = np.full((V, B), np.nan, dtype=np.float32)
+            se_block = np.full((V, B), np.nan, dtype=np.float32)
+            neff_block = np.full((V, B), np.nan, dtype=np.float32)
 
-        # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
-        for j, t in enumerate(batch_traits):
-            global_t = t_block_start + j
-            neff_study = compute_neff_study(t.N, t.K)
+            args = [
+                (j, t.trait_id, t.vcf_path, *_lookup_for(t.vcf_build), V)
+                for j, t in enumerate(batch_traits)
+            ]
+            n_done = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_fetch_trait, a): a[0] for a in args}
+                for fut in as_completed(futures):
+                    j, z, se = fut.result()
+                    z_block[:, j] = z
+                    se_block[:, j] = se
+                    n_done += 1
+                    log.info("  progress: %d/%d traits complete", t_block_start + n_done, T)
 
-            # n_variants counts observed finite z-scores; n_imputed filled post-build
-            n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
+            # ---- var_y estimation + Neff derivation (issues #10, #11) -----------
+            for j, t in enumerate(batch_traits):
+                global_t = t_block_start + j
+                neff_study = compute_neff_study(t.N, t.K)
 
-            # Validate that the VCF contained usable SE values
-            if not np.any(np.isfinite(se_block[:, j])):
-                raise ValueError(
-                    f"Trait '{t.trait_id}': no valid SE values found in VCF at "
-                    f"{t.vcf_path}. ES and SE FORMAT fields are required."
-                )
+                # n_variants counts observed finite z-scores; n_imputed filled post-build
+                n_variants_arr[global_t] = int(np.isfinite(z_block[:, j]).sum())
 
-            try:
-                vy, n_used = estimate_var_y(se_block[:, j], eaf, neff_study)
-                var_y_arr[global_t] = vy
-                n_variants_var_y_arr[global_t] = n_used
-                log.info(
-                    "  var_y[%s] = %.4f  (from %d variants, Neff_study=%.0f)",
-                    t.trait_id, vy, n_used, neff_study,
-                )
-                # Derive per-variant Neff from SE and var_y (issue #11)
-                neff_col = derive_neff(vy, se_block[:, j], eaf)
-                neff_block[:, j] = neff_col
-                finite_neff = neff_col[np.isfinite(neff_col)]
-                if len(finite_neff) > 0:
-                    neff_base[global_t] = float(np.median(finite_neff))
-            except ValueError as exc:
-                log.warning("  var_y/Neff[%s] not estimated: %s", t.trait_id, exc)
+                # Validate that the VCF contained usable SE values
+                if not np.any(np.isfinite(se_block[:, j])):
+                    raise ValueError(
+                        f"Trait '{t.trait_id}': no valid SE values found in VCF at "
+                        f"{t.vcf_path}. ES and SE FORMAT fields are required."
+                    )
 
-        for v_block_start in range(0, V, CV):
-            v_block_end = min(v_block_start + CV, V)
-            z_chunk = encode_z(z_block[v_block_start:v_block_end, :])
-            neff_chunk = encode_neff(neff_block[v_block_start:v_block_end, :])
-            zscore_mat.write_chunk(v_block_start // CV, t_block_start // CT, z_chunk)
-            neff_mat.write_chunk(v_block_start // CV, t_block_start // CT, neff_chunk)
+                try:
+                    vy, n_used = estimate_var_y(se_block[:, j], eaf, neff_study)
+                    var_y_arr[global_t] = vy
+                    n_variants_var_y_arr[global_t] = n_used
+                    log.info(
+                        "  var_y[%s] = %.4f  (from %d variants, Neff_study=%.0f)",
+                        t.trait_id, vy, n_used, neff_study,
+                    )
+                    # Derive per-variant Neff from SE and var_y (issue #11)
+                    neff_col = derive_neff(vy, se_block[:, j], eaf)
+                    neff_block[:, j] = neff_col
+                    finite_neff = neff_col[np.isfinite(neff_col)]
+                    if len(finite_neff) > 0:
+                        neff_base[global_t] = float(np.median(finite_neff))
+                except ValueError as exc:
+                    log.warning("  var_y/Neff[%s] not estimated: %s", t.trait_id, exc)
 
-        log.info("  traits %d–%d done", t_block_start, t_block_end - 1)
+            for v_block_start in range(0, V, CV):
+                v_block_end = min(v_block_start + CV, V)
+                z_chunk = encode_z(z_block[v_block_start:v_block_end, :])
+                neff_chunk = encode_neff(neff_block[v_block_start:v_block_end, :])
+                zscore_mat.write_chunk(v_block_start // CV, t_block_start // CT, z_chunk)
+                neff_mat.write_chunk(v_block_start // CV, t_block_start // CT, neff_chunk)
 
-    zscore_mat.close_write()
-    neff_mat.close_write()
+            log.info("  traits %d–%d done", t_block_start, t_block_end - 1)
 
-    # ---- Post-build imputation pass (single pass over all LD blocks) -------
+            cp = {
+                "phase": "ingestion",
+                "ingestion_t_batches_done": t_batch_idx + 1,
+                "ingestion_zscore_chunk_offsets": [int(x) for x in zscore_mat._offsets],
+                "ingestion_neff_chunk_offsets":   [int(x) for x in neff_mat._offsets],
+                "imputation_t_batches_done": 0,
+                "var_y":            [float(v) if np.isfinite(v) else None for v in var_y_arr],
+                "neff_base":        [float(v) if np.isfinite(v) else None for v in neff_base],
+                "n_variants":       n_variants_arr.tolist(),
+                "n_variants_var_y": n_variants_var_y_arr.tolist(),
+                "n_imputed":        n_imputed_arr.tolist(),
+            }
+            _save_checkpoint(out, cp)
+
+        zscore_mat.close_write()
+        neff_mat.close_write()
+
+        if cp is not None:
+            cp["phase"] = "imputation"
+        else:
+            cp = {
+                "phase": "imputation",
+                "ingestion_t_batches_done": n_t_chunks_total,
+                "ingestion_zscore_chunk_offsets": [],
+                "ingestion_neff_chunk_offsets":   [],
+                "imputation_t_batches_done": 0,
+                "var_y":            [float(v) if np.isfinite(v) else None for v in var_y_arr],
+                "neff_base":        [float(v) if np.isfinite(v) else None for v in neff_base],
+                "n_variants":       n_variants_arr.tolist(),
+                "n_variants_var_y": n_variants_var_y_arr.tolist(),
+                "n_imputed":        n_imputed_arr.tolist(),
+            }
+        _save_checkpoint(out, cp)
+
+    # ---- Post-build imputation pass (batched by t-chunk for checkpointing) --
     if block_index:
         from .impute import impute_z_block
         from .quantize import decode_z, decode_neff
 
         log.info("Post-build imputation pass: loading V×T matrices…")
-        z_full = decode_z(zscore_mat.get_block(0, V, 0, T))        # (V, T) float32
+        z_full    = decode_z(zscore_mat.get_block(0, V, 0, T))     # (V, T) float32
         neff_full = decode_neff(neff_mat.get_block(0, V, 0, T))    # (V, T) float32
-
         imputed_mask = np.zeros((V, T), dtype=bool)
         # Supply per-trait VCF paths so workers can read dense z-scores from
         # the original GWAS-VCF files, improving imputation quality.
         trait_vcf_paths = [(t.vcf_path, t.vcf_build) for t in trait_pairs]
-        impute_z_block(
-            z_full, variants, eaf, block_index,
-            thresh=ld_thresh, min_cor=ld_min_cor,
-            out_mask=imputed_mask,
-            workers=workers,
-            vcf_paths=trait_vcf_paths,
-            vcf_threads=ld_vcf_threads,
-        )
+
+        # Restore partial imputation results when resuming
+        if cp is not None and imputation_batches_done > 0:
+            n_imputed_arr[:] = [int(v) for v in cp.get("n_imputed", [0] * T)]
+            done_cols = imputation_batches_done * CT
+            partial_z_path    = out / "impute_partial.npy"
+            partial_mask_path = out / "impute_mask_partial.npy"
+            if partial_z_path.exists():
+                saved = np.load(partial_z_path)
+                cols = min(saved.shape[1], done_cols)
+                z_full[:, :cols] = saved[:, :cols]
+                log.info("Restored %d imputed trait-columns from impute_partial.npy", cols)
+            if partial_mask_path.exists():
+                saved_mask = np.load(partial_mask_path)
+                cols = min(saved_mask.shape[1], done_cols)
+                imputed_mask[:, :cols] = saved_mask[:, :cols]
+
+        for t_batch in range(imputation_batches_done, n_t_chunks_total):
+            t0 = t_batch * CT
+            t1 = min((t_batch + 1) * CT, T)
+
+            z_col    = z_full[:, t0:t1].copy()
+            mask_col = np.zeros((V, t1 - t0), dtype=bool)
+            impute_z_block(
+                z_col, variants, eaf, block_index,
+                thresh=ld_thresh, min_cor=ld_min_cor,
+                out_mask=mask_col,
+                workers=workers,
+                vcf_paths=trait_vcf_paths[t0:t1],
+                vcf_threads=ld_vcf_threads,
+            )
+            z_full[:, t0:t1]       = z_col
+            imputed_mask[:, t0:t1] = mask_col
+            n_imputed_arr[t0:t1]   = mask_col.sum(axis=0)
+
+            # Save partial files before the checkpoint so a crash here re-runs the batch
+            np.save(out / "impute_partial.npy",      z_full[:, :t1])
+            np.save(out / "impute_mask_partial.npy", imputed_mask[:, :t1])
+
+            cp["imputation_t_batches_done"] = t_batch + 1
+            cp["n_imputed"] = n_imputed_arr.tolist()
+            _save_checkpoint(out, cp)
+            log.info(
+                "Imputation batch %d/%d done (traits %d–%d)",
+                t_batch + 1, n_t_chunks_total, t0, t1 - 1,
+            )
 
         # Assign per-trait median Neff to imputed positions so betas are recoverable.
         # neff[v] = var_y / (SE² × 2·EAF·(1−EAF)) ≈ N_study independent of EAF,
         # so the trait median is a valid approximation for any imputed variant.
         neff_full = np.where(imputed_mask, neff_base[np.newaxis, :], neff_full)
 
-        # Update per-trait counts
-        n_imputed_arr[:] = imputed_mask.sum(axis=0)
-        n_variants_arr -= n_imputed_arr   # exclude imputed from observed count
+        # Update per-trait counts (done once after full imputation loop)
+        n_imputed_arr_final = imputed_mask.sum(axis=0).astype(np.int64)
+        n_variants_arr -= n_imputed_arr_final
+        n_imputed_arr[:] = n_imputed_arr_final
 
         # Accumulate COO mask
         hv, ht = np.where(imputed_mask)
@@ -677,6 +815,9 @@ def build_database(
         (out / "neff_tmp.cidx").replace(out / "neff.cidx")
         zscore_mat._cidx_cache = None  # invalidate stale cache after file replacement
         neff_mat._cidx_cache = None
+
+        for p in [out / "impute_partial.npy", out / "impute_mask_partial.npy"]:
+            p.unlink(missing_ok=True)
         log.info("Post-build imputation complete.")
 
     # ---- Imputed-positions mask --------------------------------------------
@@ -724,6 +865,7 @@ def build_database(
         "var_y": var_y_list,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    (out / _CHECKPOINT_FILE).unlink(missing_ok=True)
     log.info("Build complete → %s", out)
 
 
