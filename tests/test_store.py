@@ -104,8 +104,8 @@ class TestChunkedMatrix:
         mat.open_write()
         CV, CT = chunk
         V, T = shape
-        for vi in range((V + CV - 1) // CV):
-            for ti in range((T + CT - 1) // CT):
+        for ti in range((T + CT - 1) // CT):
+            for vi in range((V + CV - 1) // CV):
                 v0, v1 = vi * CV, min((vi + 1) * CV, V)
                 t0, t1 = ti * CT, min((ti + 1) * CT, T)
                 mat.write_chunk(vi, ti, data[v0:v1, t0:t1])

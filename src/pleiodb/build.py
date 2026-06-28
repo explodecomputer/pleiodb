@@ -663,10 +663,10 @@ def build_database(
         neff_tmp = ChunkedMatrix(out / "neff_tmp", (V, T), np.uint16, chunk_shape)
         zscore_tmp.open_write()
         neff_tmp.open_write()
-        for vi in range(zscore_mat.n_v_chunks):
-            v0, v1 = vi * CV, min((vi + 1) * CV, V)
-            for ti in range(zscore_mat.n_t_chunks):
-                t0, t1 = ti * CT, min((ti + 1) * CT, T)
+        for ti in range(zscore_mat.n_t_chunks):
+            t0, t1 = ti * CT, min((ti + 1) * CT, T)
+            for vi in range(zscore_mat.n_v_chunks):
+                v0, v1 = vi * CV, min((vi + 1) * CV, V)
                 zscore_tmp.write_chunk(vi, ti, encode_z(z_full[v0:v1, t0:t1]))
                 neff_tmp.write_chunk(vi, ti, encode_neff(neff_full[v0:v1, t0:t1]))
         zscore_tmp.close_write()
@@ -675,6 +675,8 @@ def build_database(
         (out / "zscore_tmp.cidx").replace(out / "zscore.cidx")
         (out / "neff_tmp.bin").replace(out / "neff.bin")
         (out / "neff_tmp.cidx").replace(out / "neff.cidx")
+        zscore_mat._cidx_cache = None  # invalidate stale cache after file replacement
+        neff_mat._cidx_cache = None
         log.info("Post-build imputation complete.")
 
     # ---- Imputed-positions mask --------------------------------------------
@@ -835,15 +837,15 @@ def build_lambda(
     lam_mat.open_write()
 
     CT = chunk_shape[1]
-    for ti in range(lam_mat.n_v_chunks):
-        t0i = ti * CT
-        t1i = min(t0i + CT, T)
-        col_z = decode_z(zscore.get_block(0, db.V, t0i, t1i))
+    for tj in range(lam_mat.n_t_chunks):
+        t0j = tj * CT
+        t1j = min(t0j + CT, T)
+        row_z = decode_z(zscore.get_block(0, db.V, t0j, t1j))
 
-        for tj in range(lam_mat.n_t_chunks):
-            t0j = tj * CT
-            t1j = min(t0j + CT, T)
-            row_z = decode_z(zscore.get_block(0, db.V, t0j, t1j))
+        for ti in range(lam_mat.n_v_chunks):
+            t0i = ti * CT
+            t1i = min(t0i + CT, T)
+            col_z = decode_z(zscore.get_block(0, db.V, t0i, t1i))
 
             null_i = np.abs(col_z) < z_null_thresh
             null_j = np.abs(row_z) < z_null_thresh
@@ -860,7 +862,7 @@ def build_lambda(
                         block[a, b] = float(np.corrcoef(za, zb)[0, 1])
 
             lam_mat.write_chunk(ti, tj, block.astype(np.float16))
-        log.info("lambda: t-block %d/%d done", ti + 1, lam_mat.n_v_chunks)
+        log.info("lambda: t-block %d/%d done", tj + 1, lam_mat.n_t_chunks)
 
     lam_mat.close_write()
 
@@ -937,12 +939,12 @@ def build_rho(
 
     CV = chunk_shape[0]
     CT = chunk_shape[1]
-    for ci in range(rho_mat.n_v_chunks):
-        r0 = ci * CV
-        r1 = min(r0 + CV, T)
-        for cj in range(rho_mat.n_t_chunks):
-            c0 = cj * CT
-            c1 = min(c0 + CT, T)
+    for cj in range(rho_mat.n_t_chunks):
+        c0 = cj * CT
+        c1 = min(c0 + CT, T)
+        for ci in range(rho_mat.n_v_chunks):
+            r0 = ci * CV
+            r1 = min(r0 + CV, T)
             block = rho_vals[r0:r1, c0:c1].astype(np.float16)
             rho_mat.write_chunk(ci, cj, block)
 

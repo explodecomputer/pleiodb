@@ -82,7 +82,7 @@ class ChunkedMatrix:
         return self._cidx_cache
 
     def _chunk_id(self, vi: int, ti: int) -> int:
-        return vi * self.n_t_chunks + ti
+        return ti * self.n_v_chunks + vi
 
     def _chunk_bounds(self, vi: int, ti: int) -> Tuple[int, int, int, int]:
         v0 = vi * self.CV
