@@ -389,10 +389,22 @@ class GWASDatabase:
         pairs = np.frombuffer(blob, dtype=np.uint32).reshape(-1, 2)
         v_idx = pairs[:, 0].astype(np.int64)
         t_idx = pairs[:, 1].astype(np.int64)
-        z_threshold = self._z_to_pval_threshold(pval)
-        z = self.zscore_block(v_idx, t_idx)
-        z_diag = np.array([z[i, i] for i in range(len(v_idx))])
-        return v_idx, t_idx, z_diag
+
+        # Read z-values for each (v, t) pair by grouping into chunks to avoid
+        # allocating a bounding-box matrix over all pairs at once.
+        CV, CT = self._zscore.CV, self._zscore.CT
+        n_t_chunks = self._zscore.n_t_chunks
+        z_vals = np.empty(len(v_idx), dtype=np.float32)
+        chunk_id = (v_idx // CV) * n_t_chunks + (t_idx // CT)
+        unique_chunks, inv = np.unique(chunk_id, return_inverse=True)
+        for ci, cid in enumerate(unique_chunks):
+            vi_chunk, ti_chunk = divmod(int(cid), n_t_chunks)
+            v0 = vi_chunk * CV;  v1 = min(v0 + CV, self.V)
+            t0 = ti_chunk * CT;  t1 = min(t0 + CT, self.T)
+            z_chunk = decode_z(self._zscore.get_block(v0, v1, t0, t1))
+            sel = inv == ci
+            z_vals[sel] = z_chunk[v_idx[sel] - v0, t_idx[sel] - t0]
+        return v_idx, t_idx, z_vals
 
     def _scan_significant(
         self, pval: float
