@@ -644,6 +644,13 @@ def _impute_block_process(args: tuple) -> tuple[list, int, int, int]:
 
         z_adj, corr = _poly_rescale(z_col, z_pred, npoly=3)
 
+        # Clamp imputed values to the observed |z| range for this trait×block.
+        # Prevents polynomial extrapolation from producing near-sentinel values
+        # (|z| → 327) when the polynomial overshoots outside the training range.
+        z_obs_max = np.nanmax(np.abs(z_col))
+        if np.isfinite(z_obs_max) and z_obs_max > 0:
+            z_adj = np.clip(z_adj, -z_obs_max, z_obs_max)
+
         if not np.isfinite(corr) or corr < min_cor:
             log.debug(
                 "%s trait-col %d: correlation %.3f < %.3f – skipping",
