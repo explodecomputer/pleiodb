@@ -25,6 +25,7 @@ from scipy.stats import multivariate_normal
 # ---------------------------------------------------------------------------
 
 _GRID_N = 2000  # number of ρ points in (−1, 1)
+_norm_grid_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _build_norm_grid(z_thresh: float) -> tuple[np.ndarray, np.ndarray]:
@@ -34,6 +35,9 @@ def _build_norm_grid(z_thresh: float) -> tuple[np.ndarray, np.ndarray]:
     Uses the bivariate normal CDF (exact, via scipy) evaluated at the four
     corners of the truncation square.  Returns (rho_grid, log_prob_grid).
     """
+    if z_thresh in _norm_grid_cache:
+        return _norm_grid_cache[z_thresh]
+
     rho_grid = np.linspace(-1 + 1e-6, 1 - 1e-6, _GRID_N)
     log_prob = np.empty(_GRID_N)
 
@@ -53,6 +57,7 @@ def _build_norm_grid(z_thresh: float) -> tuple[np.ndarray, np.ndarray]:
         prob = cdf[0] - cdf[1] - cdf[2] + cdf[3]
         log_prob[i] = math.log(max(prob, 1e-300))
 
+    _norm_grid_cache[z_thresh] = (rho_grid, log_prob)
     return rho_grid, log_prob
 
 
