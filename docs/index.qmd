@@ -1,0 +1,25 @@
+---
+title: "pleiodb documentation"
+---
+
+pleiodb is a chunk-compressed binary store for GWAS z-scores across a V×T matrix
+(95,378 variants × 4,159 traits). This site collects analyses and benchmarks of the
+current production database (`main.pleiodb`).
+
+## Documents
+
+| Document | Description |
+|----------|-------------|
+| [Rho matrix](rho_examine.qmd) | Distribution, clustered heatmap, and sanity checks for the sample-overlap-weighted phenotypic correlation matrix |
+| [Query benchmark](query_benchmark.qmd) | Speed and output for PheWAS, whole-trait, significant-hit, and block queries |
+| [MR positive controls](mr_controls.qmd) | IVW Mendelian randomisation for BMI→T2D, LDL→CAD, SBP→CAD; instruments stratified by imputation status; imputed z-score QC |
+| [Imputation — regional](imputation_regional.qmd) | Regional Manhattan plots (±1 Mb) before and after reference completion for three cis loci |
+| [Imputation — benchmark](imputation_benchmark.qmd) | Genome-wide imputation performance metrics |
+
+## Database summary
+
+- **V** = 95,378 variants (hg38, canonical A1 < A2 orientation)
+- **T** = 4,159 OpenGWAS traits
+- **Storage**: 512×512 zstd-compressed int16 chunks, ti-major order
+- **Imputed pairs**: 1,953,848 (LD elastic-net, dense VCF mode)
+- **Rho matrix**: sample-overlap-weighted CML estimator, same chunk layout

@@ -1,0 +1,175 @@
+---
+title: "pleiodb reference completion — regional visualisation"
+format:
+  html:
+    self-contained: true
+    code-fold: true
+    toc: true
+jupyter: python3
+---
+
+```{python}
+#| output: false
+import sys
+sys.path.insert(0, "../src")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import scipy.stats
+import zstandard, pathlib
+
+from pleiodb.db import GWASDatabase
+from pleiodb.quantize import decode_z
+
+db     = GWASDatabase.open("/local-scratch/data/pleiodb/main.pleiodb")
+traits = pd.read_csv("/local-scratch/data/pleiodb/main.pleiodb/traits.tsv", sep="\t")
+v      = db.variants
+V, T   = db.V, db.T
+
+v_chrom = np.array([v[i]["chrom"] for i in range(V)])
+v_pos   = np.array([v[i]["pos"]   for i in range(V)], dtype=np.int64)
+v_id    = np.array([v[i]["id"]    for i in range(V)])
+
+# ---- imputed COO lookup ------------------------------------------------
+blob  = zstandard.ZstdDecompressor().decompress(
+    (pathlib.Path("/local-scratch/data/pleiodb/main.pleiodb") / "imputed.coo.zst").read_bytes()
+)
+pairs    = np.frombuffer(blob, dtype=np.uint32).reshape(-1, 2)
+_t_order = np.argsort(pairs[:, 1], kind="stable")
+_t_s     = pairs[_t_order, 1]
+_v_s     = pairs[_t_order, 0]
+_t_bounds = np.searchsorted(_t_s, np.arange(T + 1))
+
+def imp_set(t_idx: int) -> np.ndarray:
+    lo, hi = int(_t_bounds[t_idx]), int(_t_bounds[t_idx + 1])
+    return _v_s[lo:hi]
+
+# ---- helper: fetch region data -----------------------------------------
+WINDOW_BP = 1_000_000
+
+def region_df(trait_id: str, chrom: str, centre_pos: int) -> pd.DataFrame:
+    t = int(db.trait_index([trait_id])[0])
+    z_all = db.zscore_trait(t)
+    imp_v = imp_set(t)
+    imp_set_t = set(imp_v.tolist())
+
+    win = np.where(
+        (v_chrom == chrom) &
+        (v_pos >= centre_pos - WINDOW_BP) &
+        (v_pos <= centre_pos + WINDOW_BP)
+    )[0]
+
+    z_win = z_all[win]
+    pval  = 2 * scipy.stats.norm.sf(np.abs(z_win))
+    logp  = -np.log10(np.maximum(pval, 1e-300))
+    is_imp = np.array([w in imp_set_t for w in win])
+
+    return pd.DataFrame({
+        "pos":     v_pos[win],
+        "id":      v_id[win],
+        "z":       z_win,
+        "logp":    logp,
+        "imputed": is_imp,
+    })
+```
+
+Reference completion fills in z-scores for pleiodb variants that are absent in a
+given study. Each panel below shows the same ±1 Mb cis window for a trait with
+substantial imputation. **Blue circles** are directly observed (from the study
+VCF); **orange triangles** are imputed by the LD elastic-net pass.
+
+The *before* picture is the blue points only; *after* is both.
+
+```{python}
+regions = [
+    dict(
+        trait_id  = "ebi-a-GCST90025958",
+        name      = "Sex hormone-binding globulin",
+        chrom     = "14",
+        centre    = 94006000,
+        gene      = "SHBG (chr14:~94 Mb)",
+    ),
+    dict(
+        trait_id  = "ebi-a-GCST90025953",
+        name      = "Total cholesterol",
+        chrom     = "2",
+        centre    = 20449000,
+        gene      = "APOB (chr2:~20 Mb)",
+    ),
+    dict(
+        trait_id  = "ebi-a-GCST005063",
+        name      = "Glomerular filtration rate",
+        chrom     = "1",
+        centre    = 163313000,
+        gene      = "chr1:~163 Mb",
+    ),
+]
+
+fig = plt.figure(figsize=(15, 12))
+gs  = gridspec.GridSpec(len(regions), 2, figure=fig, wspace=0.25, hspace=0.50,
+                        width_ratios=[1, 1])
+
+for row, r in enumerate(regions):
+    df = region_df(r["trait_id"], r["chrom"], r["centre"])
+    df = df.dropna(subset=["z"])
+
+    obs = df[~df["imputed"]]
+    imp = df[ df["imputed"]]
+
+    pos_mb = df["pos"] / 1e6
+
+    # ---- left panel: observed only ("before") ----
+    ax_b = fig.add_subplot(gs[row, 0])
+    ax_b.scatter(obs["pos"] / 1e6, obs["logp"],
+                 s=18, color="steelblue", alpha=0.75, label=f"observed (n={len(obs)})",
+                 linewidths=0, zorder=3)
+    ax_b.axhline(-np.log10(5e-8), color="red", lw=0.8, ls="--", alpha=0.6)
+    ax_b.set_xlim((r["centre"] - WINDOW_BP) / 1e6, (r["centre"] + WINDOW_BP) / 1e6)
+    ax_b.set_xlabel("Position (Mb)", fontsize=8)
+    ax_b.set_ylabel("−log₁₀ p", fontsize=8)
+    ax_b.set_title(f"{r['name']}\n{r['gene']} — before (observed only)", fontsize=9)
+    ax_b.legend(fontsize=7, loc="upper right")
+    ax_b.tick_params(labelsize=7)
+
+    # ---- right panel: observed + imputed ("after") ----
+    ax_a = fig.add_subplot(gs[row, 1])
+    ax_a.scatter(obs["pos"] / 1e6, obs["logp"],
+                 s=18, color="steelblue", alpha=0.75, label=f"observed (n={len(obs)})",
+                 linewidths=0, zorder=3)
+    ax_a.scatter(imp["pos"] / 1e6, imp["logp"],
+                 s=28, marker="^", color="orange", alpha=0.85,
+                 label=f"imputed (n={len(imp)})", linewidths=0, zorder=4)
+    ax_a.axhline(-np.log10(5e-8), color="red", lw=0.8, ls="--", alpha=0.6)
+    ax_a.set_xlim((r["centre"] - WINDOW_BP) / 1e6, (r["centre"] + WINDOW_BP) / 1e6)
+    ax_a.set_xlabel("Position (Mb)", fontsize=8)
+    ax_a.set_ylabel("−log₁₀ p", fontsize=8)
+    ax_a.set_title(f"{r['name']}\n{r['gene']} — after (+ imputed)", fontsize=9)
+    ax_a.legend(fontsize=7, loc="upper right")
+    ax_a.tick_params(labelsize=7)
+
+plt.suptitle("Reference completion: cis-regional Manhattan plots (±1 Mb)", fontsize=12,
+             fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# Summary table
+rows = []
+for r in regions:
+    df = region_df(r["trait_id"], r["chrom"], r["centre"]).dropna(subset=["z"])
+    obs = df[~df["imputed"]]
+    imp = df[ df["imputed"]]
+    rows.append({
+        "Trait":           r["name"],
+        "Region":          r["gene"],
+        "Observed":        len(obs),
+        "Imputed":         len(imp),
+        "% imputed":       f"{100*len(imp)/(len(obs)+len(imp)):.0f}%",
+        "Max obs −log₁₀p": f"{obs['logp'].max():.1f}",
+        "Max imp −log₁₀p": f"{imp['logp'].max():.1f}" if len(imp) else "—",
+    })
+pd.DataFrame(rows)
+```

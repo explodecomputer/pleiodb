@@ -1,0 +1,401 @@
+---
+title: "pleiodb query benchmark"
+format:
+  html:
+    self-contained: true
+    code-fold: true
+    toc: true
+jupyter: python3
+---
+
+```{python}
+#| output: false
+import sys
+sys.path.insert(0, "../src")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import scipy.stats
+import zstandard, pathlib, time
+from pleiodb.db import GWASDatabase
+from pleiodb.quantize import decode_neff, reconstruct_beta_se
+
+db = GWASDatabase.open("/local-scratch/data/pleiodb/main.pleiodb")
+traits_meta = pd.read_csv("/local-scratch/data/pleiodb/main.pleiodb/traits.tsv", sep="\t")
+
+v_chrom   = np.array([v["chrom"] for v in db.variants])
+v_pos     = np.array([v["pos"]   for v in db.variants])
+v_id_arr  = np.array([v["id"]    for v in db.variants])
+eaf_arr   = db.eaf  # float32(V)
+
+# --- Imputation lookup (sorted COO → per-variant index) ---
+coo_path = pathlib.Path("/local-scratch/data/pleiodb/main.pleiodb/imputed.coo.zst")
+_blob    = zstandard.ZstdDecompressor().decompress(coo_path.read_bytes())
+_pairs   = np.frombuffer(_blob, dtype=np.uint32).reshape(-1, 2)
+_order   = np.argsort(_pairs[:, 0], kind="stable")
+_v_sorted, _t_sorted = _pairs[_order, 0], _pairs[_order, 1]
+_v_bounds = np.searchsorted(_v_sorted, np.arange(db.V + 1))
+
+def imputed_traits(v_idx: int) -> np.ndarray:
+    """Return array of trait indices imputed for this variant."""
+    lo, hi = int(_v_bounds[v_idx]), int(_v_bounds[v_idx + 1])
+    return _t_sorted[lo:hi].astype(np.int64)
+
+# --- Chromosome offsets for Manhattan plots ---
+CHR_LEN = {
+    "1":249250621,"2":243199373,"3":198022430,"4":191154276,"5":180915260,
+    "6":171115067,"7":159138663,"8":146364022,"9":141213431,"10":135534747,
+    "11":135006516,"12":133851895,"13":115169878,"14":107349540,"15":102531392,
+    "16":90354753, "17":81195210, "18":78077248, "19":59128983, "20":63025520,
+    "21":48129895, "22":51304566,
+}
+GAP = 5_000_000
+cum_offset = {}
+off = 0
+for ch in [str(i) for i in range(1, 23)]:
+    cum_offset[ch] = off
+    off += CHR_LEN.get(ch, 0) + GAP
+
+def phewas_df(v_idx: int) -> pd.DataFrame:
+    """Tidy PheWAS DataFrame for one variant: alid, trait_id, z, beta_norm, se_norm, pval, eaf, n, imputed."""
+    v = int(v_idx)
+    z    = db.zscore_variant(v)
+    neff = decode_neff(db._neff.get_block(v, v + 1, 0, db.T)[0])
+    eaf_v = eaf_arr[v]
+    beta, se = reconstruct_beta_se(z, neff, np.array([eaf_v], dtype=np.float32))
+    pval = 2 * scipy.stats.norm.sf(np.abs(z))
+    imp_t = imputed_traits(v)
+    is_imputed = np.zeros(db.T, dtype=bool)
+    is_imputed[imp_t] = True
+    return pd.DataFrame({
+        "alid":      v_id_arr[v],
+        "trait_id":  traits_meta["trait_id"].values,
+        "trait_name":traits_meta["trait_name"].values,
+        "z":         z,
+        "beta_norm": beta,
+        "se_norm":   se,
+        "pval":      pval,
+        "eaf":       float(eaf_v),
+        "n":         neff,
+        "imputed":   is_imputed,
+    }).dropna(subset=["z"])
+
+def trait_df(t_idx: int) -> pd.DataFrame:
+    """Tidy genome-wide DataFrame for one trait."""
+    t = int(t_idx)
+    z    = db.zscore_trait(t)
+    neff = decode_neff(db._neff.get_block(0, db.V, t, t + 1)[:, 0])
+    beta, se = reconstruct_beta_se(z, neff, eaf_arr)
+    pval = 2 * scipy.stats.norm.sf(np.abs(z))
+    # Imputation flag for this trait column
+    t_mask = _pairs[_order, 1] == t
+    imp_v_set = set(_pairs[_order[t_mask], 0].tolist())
+    is_imputed = np.array([i in imp_v_set for i in range(db.V)], dtype=bool)
+    return pd.DataFrame({
+        "alid":      v_id_arr,
+        "chrom":     v_chrom,
+        "pos":       v_pos,
+        "trait_id":  traits_meta.iloc[t]["trait_id"],
+        "z":         z,
+        "beta_norm": beta,
+        "se_norm":   se,
+        "pval":      pval,
+        "eaf":       eaf_arr,
+        "n":         neff,
+        "imputed":   is_imputed,
+    }).dropna(subset=["z"])
+```
+
+pleiodb stores `{python} f"{db.V:,}"` variants × `{python} f"{db.T:,}"` traits as a chunk-compressed
+binary matrix on disk. All queries go directly to disk — no in-memory index, no server.
+Output columns are uniform: `alid · trait_id · z · beta_norm · se_norm · pval · eaf · n · imputed`.
+
+---
+
+## 1. PheWAS — one variant, all traits
+
+All `{python} f"{db.T:,}"` traits for a single variant. Reads one row of the V×T matrix.
+
+**CLI:**
+```bash
+pleiodb query main.pleiodb --variant 1:158825350_A_C
+```
+
+```{python}
+query_v = "1:158825350_A_C"
+v_idx = int(db.variant_index([query_v])[0])
+
+times = []
+for _ in range(20):
+    t0 = time.perf_counter()
+    _ = db.zscore_variant(v_idx)
+    times.append(time.perf_counter() - t0)
+
+res = phewas_df(v_idx)
+print(f"Variant:    {query_v}  (EAF={eaf_arr[v_idx]:.3f})")
+print(f"Query time: {np.mean(times)*1000:.1f} ms  (n=20)")
+print(f"Traits with data: {len(res):,} / {db.T:,}  ({res['imputed'].sum()} imputed)")
+```
+
+**Top hits by |z|:**
+
+```{python}
+top = (res.sort_values("z", key=np.abs, ascending=False).head(10).reset_index(drop=True))
+disp = top[["trait_id","trait_name","z","beta_norm","se_norm","pval","eaf","n","imputed"]].copy()
+disp["z"]         = disp["z"].round(3)
+disp["beta_norm"] = disp["beta_norm"].round(4)
+disp["se_norm"]   = disp["se_norm"].round(5)
+disp["eaf"]       = disp["eaf"].round(3)
+disp["n"]         = disp["n"].round(0).astype(int)
+disp["pval"]      = disp["pval"].apply(lambda p: f"{p:.2e}")
+disp
+```
+
+> **Note on z=−100.9 (Asthma, ebi-a-GCST007799):** genuine stored value — the
+> missing-data sentinel decodes to −327.7, so this is not missing. With N=327,253
+> and K=0.08, z∣∣>100 is feasible at major loci.
+
+---
+
+## 2. Whole trait — all variants, one trait
+
+All `{python} f"{db.V:,}"` variants for a single trait (genome-wide).
+
+**CLI:**
+```bash
+pleiodb query main.pleiodb --trait ukb-b-10787
+```
+
+```{python}
+query_t  = "ukb-b-10787"
+t_row    = traits_meta[traits_meta["trait_id"] == query_t].iloc[0]
+t_idx    = int(db.trait_index([query_t])[0])
+
+times = []
+for _ in range(10):
+    t0 = time.perf_counter()
+    _ = db.zscore_trait(t_idx)
+    times.append(time.perf_counter() - t0)
+
+res_t = trait_df(t_idx)
+print(f"Trait:      {query_t}  ({t_row['trait_name']})")
+print(f"Query time: {np.mean(times)*1000:.1f} ms  (n=10)")
+print(f"Variants with data: {len(res_t):,}  ({res_t['imputed'].sum():,} imputed)")
+```
+
+**Manhattan plot (genomic position, z²):**
+
+```{python}
+x_obs = np.array([cum_offset.get(c, 0) + p for c, p in
+                  zip(res_t["chrom"], res_t["pos"])], dtype=np.float64)
+z2    = res_t["z"].values ** 2
+imp   = res_t["imputed"].values
+
+chroms = [str(c) for c in range(1, 23)]
+colors = ["steelblue", "tomato"]
+fig, ax = plt.subplots(figsize=(14, 4))
+
+for i, ch in enumerate(chroms):
+    mask = (res_t["chrom"].values == ch) & ~imp
+    if mask.any():
+        ax.scatter(x_obs[mask], z2[mask], s=1, alpha=0.4,
+                   color=colors[i % 2], linewidths=0)
+    mask_imp = (res_t["chrom"].values == ch) & imp
+    if mask_imp.any():
+        ax.scatter(x_obs[mask_imp], z2[mask_imp], s=2, alpha=0.7,
+                   color="orange", linewidths=0)
+
+tick_pos   = [cum_offset[ch] + CHR_LEN[ch] / 2 for ch in chroms if ch in cum_offset]
+tick_lbls  = chroms
+ax.set_xticks(tick_pos)
+ax.set_xticklabels(tick_lbls, fontsize=7)
+ax.set_xlabel("Chromosome (hg19)")
+ax.set_ylabel("z²")
+ax.set_title(f"{query_t}: {t_row['trait_name']}  —  genome-wide z²")
+ax.axhline(y=29.7, color="black", lw=0.8, ls="--", label="p=5×10⁻⁸")
+from matplotlib.lines import Line2D
+ax.legend(handles=[
+    Line2D([0],[0], marker='o', color='w', markerfacecolor='steelblue', label='observed'),
+    Line2D([0],[0], marker='o', color='w', markerfacecolor='orange',    label='imputed'),
+    Line2D([0],[0], color='black', ls='--', label='p=5×10⁻⁸'),
+], fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 3. Significant hits for a trait
+
+Variants passing p≤5×10⁻⁸ for one trait.
+
+**CLI:**
+```bash
+pleiodb query main.pleiodb --trait ukb-b-10787 --pval 5e-8
+```
+
+```{python}
+res_sig = (res_t[res_t["pval"] <= 5e-8]
+           .sort_values("z", key=np.abs, ascending=False)
+           .head(10).reset_index(drop=True))
+print(f"Significant hits (p≤5×10⁻⁸): {(res_t['pval']<=5e-8).sum():,}")
+
+disp = res_sig[["alid","z","beta_norm","se_norm","pval","eaf","n","imputed"]].copy()
+disp["z"]         = disp["z"].round(3)
+disp["beta_norm"] = disp["beta_norm"].round(4)
+disp["se_norm"]   = disp["se_norm"].round(5)
+disp["eaf"]       = disp["eaf"].round(3)
+disp["n"]         = disp["n"].round(0).astype(int)
+disp["pval"]      = disp["pval"].apply(lambda p: f"{p:.2e}")
+disp
+```
+
+---
+
+## 4. Random lookup — 20 variants × 20 traits
+
+z-scores at 20 randomly chosen variants and 20 randomly chosen traits.
+
+**CLI:**
+```bash
+pleiodb query main.pleiodb --variants-file v20.txt --traits-file t20.txt
+```
+
+```{python}
+rng      = np.random.default_rng(42)
+v20_idx  = list(rng.integers(0, db.V, 20).astype(int))
+t20_idx  = list(rng.integers(0, db.T, 20).astype(int))
+
+times = []
+for _ in range(20):
+    t0 = time.perf_counter()
+    z_block = np.vstack([db.zscore_variant(v)[t20_idx] for v in v20_idx])
+    times.append(time.perf_counter() - t0)
+
+print(f"Query time: {np.mean(times)*1000:.1f} ms  (n=20)")
+```
+
+```{python}
+v20_ids   = [db.variants[v]["id"]   for v in v20_idx]
+t20_names = [db.traits[t]["name"][:28] for t in t20_idx]
+imp_block = np.zeros((20, 20), dtype=bool)
+for i, vi in enumerate(v20_idx):
+    imp_t = set(imputed_traits(vi).tolist())
+    for j, tj in enumerate(t20_idx):
+        imp_block[i, j] = tj in imp_t
+
+fig, ax = plt.subplots(figsize=(10, 6))
+z_plot = np.where(imp_block, np.nan, z_block)
+im = ax.imshow(z_plot, aspect="auto", cmap="RdBu_r", vmin=-5, vmax=5,
+               interpolation="nearest")
+# Overlay imputed cells with a distinct colormap
+z_imp = np.where(imp_block, z_block, np.nan)
+ax.imshow(z_imp, aspect="auto", cmap="PuOr", vmin=-5, vmax=5,
+          interpolation="nearest", alpha=0.9)
+ax.set_xticks(range(20))
+ax.set_xticklabels(t20_names, rotation=90, fontsize=7)
+ax.set_yticks(range(20))
+ax.set_yticklabels(v20_ids, fontsize=7)
+plt.colorbar(im, ax=ax, label="z-score")
+ax.set_title("20 variants × 20 traits  (blue/red = observed, purple/orange = imputed)")
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 5. Beta reliability — 30 random variants PheWAS
+
+Do the reconstructed beta values look reasonable?  We expect the distribution
+across all trait×variant pairs to be centred on zero with a roughly normal
+shape (most pairs are null), with imputed values potentially noisier.
+
+```{python}
+rng     = np.random.default_rng(7)
+v30_idx = rng.integers(0, db.V, 30).astype(int)
+
+all_beta, all_z, all_imp = [], [], []
+for vi in v30_idx:
+    df = phewas_df(int(vi))
+    all_beta.append(df["beta_norm"].values)
+    all_z.append(df["z"].values)
+    all_imp.append(df["imputed"].values)
+
+beta_all = np.concatenate(all_beta)
+z_all    = np.concatenate(all_z)
+imp_all  = np.concatenate(all_imp)
+
+print(f"Total trait×variant pairs: {len(beta_all):,}")
+print(f"  Observed: {(~imp_all).sum():,}   Imputed: {imp_all.sum():,}")
+print(f"  Beta NaN: {np.isnan(beta_all).sum():,}")
+```
+
+```{python}
+obs_beta = beta_all[~imp_all & np.isfinite(beta_all)]
+imp_beta = beta_all[ imp_all & np.isfinite(beta_all)]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+# --- Distribution ---
+bins = np.linspace(-0.2, 0.2, 120)
+axes[0].hist(obs_beta, bins=bins, alpha=0.6, color="steelblue",
+             label=f"observed (n={len(obs_beta):,})", density=True)
+axes[0].hist(imp_beta, bins=bins, alpha=0.6, color="orange",
+             label=f"imputed  (n={len(imp_beta):,})", density=True)
+# Overlay expected N(0, σ²) fit to observed
+mu, sd = np.nanmean(obs_beta), np.nanstd(obs_beta)
+xg = np.linspace(-0.25, 0.25, 300)
+axes[0].plot(xg, scipy.stats.norm.pdf(xg, mu, sd),
+             "k--", lw=1.2, label=f"N({mu:.4f}, {sd:.4f}²)")
+axes[0].set_xlabel("beta_norm")
+axes[0].set_ylabel("density")
+axes[0].set_title("Beta distribution across 30 PheWAS variants")
+axes[0].legend(fontsize=8)
+axes[0].set_xlim(-0.25, 0.25)
+
+# --- QQ plot against normal ---
+for arr, col, lab in [(obs_beta, "steelblue", "observed"),
+                       (imp_beta, "orange",    "imputed")]:
+    sample = arr[np.isfinite(arr)]
+    q_obs  = np.quantile(sample, np.linspace(0.001, 0.999, 500))
+    q_exp  = scipy.stats.norm.ppf(np.linspace(0.001, 0.999, 500),
+                                   loc=np.mean(sample), scale=np.std(sample))
+    axes[1].scatter(q_exp, q_obs, s=4, alpha=0.5, color=col, label=lab)
+
+mn = min(obs_beta[np.isfinite(obs_beta)].min(), imp_beta[np.isfinite(imp_beta)].min() if len(imp_beta) else 0)
+mx = max(obs_beta[np.isfinite(obs_beta)].max(), imp_beta[np.isfinite(imp_beta)].max() if len(imp_beta) else 0)
+axes[1].plot([mn, mx], [mn, mx], "k--", lw=1, label="y=x")
+axes[1].set_xlabel("expected quantile (normal fit)")
+axes[1].set_ylabel("observed beta_norm quantile")
+axes[1].set_title("QQ plot — beta_norm vs normal")
+axes[1].legend(fontsize=8)
+
+plt.tight_layout()
+plt.show()
+
+print(f"\nObserved beta:  mean={np.nanmean(obs_beta):.5f}  sd={np.nanstd(obs_beta):.4f}"
+      f"  skew={scipy.stats.skew(obs_beta[np.isfinite(obs_beta)]):.3f}")
+print(f"Imputed  beta:  mean={np.nanmean(imp_beta):.5f}  sd={np.nanstd(imp_beta):.4f}"
+      f"  skew={scipy.stats.skew(imp_beta[np.isfinite(imp_beta)]):.3f}" if len(imp_beta) else "Imputed beta: none")
+```
+
+---
+
+## Summary
+
+```{python}
+t0 = time.perf_counter()
+vs_all, ts_all, zs_all = db.query_significant(5e-8)
+t_coo = time.perf_counter() - t0
+
+pd.DataFrame([
+    {"Query": "PheWAS (1 variant × all traits)",       "Time": "~6 ms",    "Rows": f"{db.T:,}"},
+    {"Query": "Whole trait (all variants × 1 trait)",  "Time": "~100 ms",  "Rows": f"{db.V:,}"},
+    {"Query": "Sig hits for one trait (p≤5×10⁻⁸)",    "Time": "~100 ms",  "Rows": f"{(res_t['pval']<=5e-8).sum():,}"},
+    {"Query": "All sig hits (p≤5×10⁻⁸)",              "Time": f"~{t_coo:.1f} s", "Rows": f"{len(vs_all):,}"},
+    {"Query": "Random 20×20 block",                    "Time": "~130 ms",  "Rows": "400"},
+])
+```
+
+All timings: single-core Python, `{python} f"{db.V:,}"` × `{python} f"{db.T:,}"`, 512×512 zstd-compressed int16 chunks.

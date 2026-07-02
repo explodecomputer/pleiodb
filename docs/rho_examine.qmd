@@ -1,0 +1,169 @@
+---
+title: "pleiodb rho matrix examination"
+format:
+  html:
+    self-contained: true
+    code-fold: true
+    toc: true
+jupyter: python3
+---
+
+```{python}
+import sys
+sys.path.insert(0, "../src")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import seaborn as sns
+from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
+from scipy.spatial.distance import squareform
+from pleiodb.db import GWASDatabase
+
+db = GWASDatabase.open("/local-scratch/data/pleiodb/main.pleiodb")
+T = db.T
+traits = pd.read_csv("/local-scratch/data/pleiodb/main.pleiodb/traits.tsv", sep="\t")
+print(f"T = {T}, traits table shape: {traits.shape}")
+```
+
+```{python}
+idx = list(range(T))
+rho = db.get_rho_block(idx, idx)
+print(f"rho matrix: {rho.shape}, dtype={rho.dtype}")
+upper_i, upper_j = np.triu_indices(T, k=1)
+upper = rho[upper_i, upper_j]
+print(f"Upper triangle: {len(upper):,} pairs, {np.isnan(upper).sum():,} NaN")
+```
+
+## Distribution of rho values
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+vals = upper[~np.isnan(upper)]
+
+axes[0].hist(vals, bins=200, color="steelblue", edgecolor="none")
+axes[0].set_xlabel("rho")
+axes[0].set_ylabel("pairs")
+axes[0].set_title(f"Distribution of rho ({len(vals):,} pairs)")
+axes[0].axvline(0, color="black", lw=0.8, ls="--")
+
+axes[1].hist(vals, bins=200, color="steelblue", edgecolor="none")
+axes[1].set_yscale("log")
+axes[1].set_xlabel("rho")
+axes[1].set_ylabel("pairs (log scale)")
+axes[1].set_title("Distribution of rho (log y)")
+axes[1].axvline(0, color="black", lw=0.8, ls="--")
+
+plt.tight_layout()
+plt.show()
+
+print(f"Mean:   {vals.mean():.4f}")
+print(f"Median: {np.median(vals):.4f}")
+print(f"SD:     {vals.std():.4f}")
+print(f"|rho| > 0.1: {(np.abs(vals) > 0.1).sum():,}  ({100*(np.abs(vals)>0.1).mean():.1f}%)")
+print(f"|rho| > 0.3: {(np.abs(vals) > 0.3).sum():,}  ({100*(np.abs(vals)>0.3).mean():.2f}%)")
+print(f"|rho| > 0.5: {(np.abs(vals) > 0.5).sum():,}  ({100*(np.abs(vals)>0.5).mean():.3f}%)")
+```
+
+## Highest and lowest rho pairs
+
+```{python}
+pairs = pd.DataFrame({
+    "trait_id_1": traits.iloc[upper_i]["trait_id"].values,
+    "trait_name_1": traits.iloc[upper_i]["trait_name"].values,
+    "trait_id_2": traits.iloc[upper_j]["trait_id"].values,
+    "trait_name_2": traits.iloc[upper_j]["trait_name"].values,
+    "rho": upper,
+}).dropna(subset=["rho"])
+```
+
+### Top 30 positive rho pairs
+
+```{python}
+top_pos = pairs.nlargest(30, "rho")[["trait_name_1", "trait_name_2", "rho"]].reset_index(drop=True)
+top_pos["rho"] = top_pos["rho"].round(3)
+top_pos.index += 1
+top_pos
+```
+
+### Top 30 negative rho pairs
+
+```{python}
+top_neg = pairs.nsmallest(30, "rho")[["trait_name_1", "trait_name_2", "rho"]].reset_index(drop=True)
+top_neg["rho"] = top_neg["rho"].round(3)
+top_neg.index += 1
+top_neg
+```
+
+## Clustered heatmap (top 200 traits by |rho| with others)
+
+To keep the heatmap tractable, we select the 200 traits that have the highest
+mean |rho| with all other traits.
+
+```{python}
+mean_abs_rho = np.nanmean(np.abs(rho), axis=1)
+top200_idx = np.argsort(mean_abs_rho)[::-1][:200]
+top200_idx_sorted = np.sort(top200_idx)
+
+rho_sub = rho[np.ix_(top200_idx_sorted, top200_idx_sorted)]
+labels = traits.iloc[top200_idx_sorted]["trait_name"].str[:40].values
+
+# Replace NaN with 0 for clustering distance
+rho_sub_nonan = np.where(np.isnan(rho_sub), 0.0, rho_sub)
+np.fill_diagonal(rho_sub_nonan, 1.0)
+
+# Hierarchical clustering on dissimilarity 1 - |rho|
+dist = squareform(1.0 - np.abs(rho_sub_nonan), checks=False)
+Z = linkage(dist, method="average")
+order = leaves_list(Z)
+
+rho_ord = rho_sub_nonan[np.ix_(order, order)]
+labels_ord = labels[order]
+
+fig, ax = plt.subplots(figsize=(14, 12))
+cmap = sns.diverging_palette(220, 20, as_cmap=True)
+im = ax.imshow(rho_ord, aspect="auto", cmap=cmap, vmin=-1, vmax=1,
+               interpolation="nearest")
+ax.set_xticks(range(200))
+ax.set_yticks(range(200))
+ax.set_xticklabels(labels_ord, fontsize=3, rotation=90)
+ax.set_yticklabels(labels_ord, fontsize=3)
+plt.colorbar(im, ax=ax, shrink=0.6, label="rho")
+ax.set_title("Clustered rho heatmap — top 200 traits by mean |rho|")
+plt.tight_layout()
+plt.show()
+```
+
+## Trait-level rho summary
+
+```{python}
+traits_rho = traits.copy()
+traits_rho["mean_abs_rho"] = np.nanmean(np.abs(rho), axis=1)
+traits_rho["max_abs_rho"]  = np.nanmax(np.abs(rho - np.eye(T)), axis=1)
+traits_rho["n_high_rho"]   = (np.abs(rho - np.eye(T)) > 0.3).sum(axis=1)
+
+print("Top 20 traits by mean |rho| with all others:")
+(traits_rho[["trait_id", "trait_name", "mean_abs_rho", "max_abs_rho", "n_high_rho"]]
+ .nlargest(20, "mean_abs_rho")
+ .round(3)
+ .reset_index(drop=True))
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].hist(traits_rho["mean_abs_rho"], bins=100, color="steelblue", edgecolor="none")
+axes[0].set_xlabel("mean |rho| across all other traits")
+axes[0].set_ylabel("traits")
+axes[0].set_title("Per-trait mean |rho|")
+
+axes[1].hist(traits_rho["n_high_rho"], bins=60, color="tomato", edgecolor="none")
+axes[1].set_xlabel("number of traits with |rho| > 0.3")
+axes[1].set_ylabel("traits")
+axes[1].set_title("Per-trait high-|rho| partner count")
+
+plt.tight_layout()
+plt.show()
+```

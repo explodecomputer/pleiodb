@@ -1,0 +1,27 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "pleiodb"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: rho_examine.qmd
+        text: Rho matrix
+      - href: query_benchmark.qmd
+        text: Query benchmark
+      - href: mr_controls.qmd
+        text: MR controls
+      - href: imputation_regional.qmd
+        text: Imputation regional
+      - href: imputation_benchmark.qmd
+        text: Imputation benchmark
+
+format:
+  html:
+    theme: cosmo
+    self-contained: true
+    toc: true
+    code-fold: true
